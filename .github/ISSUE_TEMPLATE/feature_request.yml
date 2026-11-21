@@ -1,0 +1,27 @@
+name: Feature request
+description: Suggest an idea or a new maintenance step. You can write in any language.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! You can write in **any language**.
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like the script to do?
+      description: Describe the problem it solves and how you imagine it working.
+    validations:
+      required: true
+  - type: dropdown
+    id: versions
+    attributes:
+      label: Which Windows versions does it concern?
+      multiple: true
+      options:
+        - Windows 11 Home/Pro
+        - Windows 11 Enterprise/Education
+        - Windows 10
+        - Windows 10/11 LTSC
+        - Windows Server
+        - All

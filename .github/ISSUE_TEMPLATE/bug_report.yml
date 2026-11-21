@@ -1,0 +1,42 @@
+name: Bug report
+description: Something did not work as expected. You can write in any language.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! You can write in **any language**.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead? Which step was involved?
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: First "System" line of the script output, or the result of `winver`.
+      placeholder: Windows 11 Pro, version 25H2 (OS build 26200.1234)
+    validations:
+      required: true
+  - type: input
+    id: powershell
+    attributes:
+      label: PowerShell version
+      description: Output of `$PSVersionTable.PSVersion`
+      placeholder: "5.1.26100.1"
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command used
+      placeholder: .\Invoke-WindowsMaintenance.ps1 -Skip Repair
+  - type: textarea
+    id: report
+    attributes:
+      label: JSON report or log excerpt
+      description: From `%ProgramData%\WindowsHealthAndUpdate\Logs`. Please review it before posting.
+      render: json
