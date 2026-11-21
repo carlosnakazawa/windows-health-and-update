@@ -313,29 +313,27 @@ Describe 'Invoke-UpgradeReadinessStep' {
         $result = Invoke-UpgradeReadinessStep
 
         $result.Status | Should -Be 'Warning'
-        $result.Message | Should -Match 'TPM 2\.0'
-        $result.Message | Should -Not -Match 'RAM'
-        $result.Message | Should -Not -Match 'CPU'
+        $result.Message | Should -Match '^Not ready for Windows 11: TPM 2\.0\.'
     }
 }
 
 Describe 'Register-MaintenanceTask helpers' {
-    It 'accepts safe MaintenanceArguments: <Args>' -ForEach @(
-        @{ Args = '' }
-        @{ Args = '-Skip Repair, Defender' }
-        @{ Args = "-Only WinGet, WindowsUpdate -LogDirectory 'C:\Logs'" }
+    It 'accepts safe MaintenanceArguments: <Value>' -ForEach @(
+        @{ Value = '' }
+        @{ Value = '-Skip Repair, Defender' }
+        @{ Value = "-Only WinGet, WindowsUpdate -LogDirectory 'C:\Logs'" }
     ) {
-        Test-SafeMaintenanceArguments -Arguments $Args | Should -BeTrue
+        Test-SafeMaintenanceArgument -Arguments $Value | Should -BeTrue
     }
 
-    It 'rejects unsafe MaintenanceArguments: <Args>' -ForEach @(
-        @{ Args = '-Skip Repair; calc.exe' }
-        @{ Args = '$(whoami)' }
-        @{ Args = '-Skip Repair | Out-Null' }
-        @{ Args = '-Skip Repair & calc.exe' }
-        @{ Args = '-LogDirectory "C:\Logs"' }
+    It 'rejects unsafe MaintenanceArguments: <Value>' -ForEach @(
+        @{ Value = '-Skip Repair; calc.exe' }
+        @{ Value = '$(whoami)' }
+        @{ Value = '-Skip Repair | Out-Null' }
+        @{ Value = '-Skip Repair & calc.exe' }
+        @{ Value = '-LogDirectory "C:\Logs"' }
     ) {
-        Test-SafeMaintenanceArguments -Arguments $Args | Should -BeFalse
+        Test-SafeMaintenanceArgument -Arguments $Value | Should -BeFalse
     }
 
     It 'detects user-writable paths inside the user profile' {

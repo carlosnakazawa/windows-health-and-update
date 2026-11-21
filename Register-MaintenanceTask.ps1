@@ -145,7 +145,7 @@ function Test-IsPathUserWritable {
     $false
 }
 
-function Test-SafeMaintenanceArguments {
+function Test-SafeMaintenanceArgument {
     <#
         Rejects shell metacharacters (;, |, &, `, $, (), <>, ", newlines) so that
         -MaintenanceArguments cannot inject extra commands into the elevated task.
@@ -181,7 +181,7 @@ if ($Unregister) {
     return
 }
 
-if (-not (Test-SafeMaintenanceArguments -Arguments $MaintenanceArguments)) {
+if (-not (Test-SafeMaintenanceArgument -Arguments $MaintenanceArguments)) {
     throw 'MaintenanceArguments contains disallowed shell metacharacters (;, |, &, `, $, (), <>, ", or newlines).'
 }
 
