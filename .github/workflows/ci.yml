@@ -35,15 +35,16 @@ jobs:
       matrix:
         os: [windows-2022, windows-2025]
         shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@v5
 
       - name: Install Pester
-        shell: ${{ matrix.shell }}
         run: Install-Module -Name Pester -MinimumVersion 5.5.0 -Scope CurrentUser -Force -SkipPublisherCheck
 
       - name: Unit tests
-        shell: ${{ matrix.shell }}
         run: |
           Import-Module -Name Pester -MinimumVersion 5.5.0
           $config = New-PesterConfiguration
@@ -55,7 +56,6 @@ jobs:
       # Runs the real entry point on Windows Server 2022/2025 without changing anything:
       # version detection, lifecycle lookup, step applicability and the JSON report.
       - name: Smoke test (-WhatIf)
-        shell: ${{ matrix.shell }}
         run: |
           $logs = Join-Path $env:RUNNER_TEMP 'maintenance-logs'
           ./Invoke-WindowsMaintenance.ps1 -WhatIf -LogDirectory $logs
