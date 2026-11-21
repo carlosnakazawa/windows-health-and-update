@@ -5,8 +5,10 @@ param()
 
 BeforeAll {
     $scriptPath = Join-Path -Path $PSScriptRoot -ChildPath '..\Invoke-WindowsMaintenance.ps1'
-    # Dot-sourcing loads the functions only; the entry point returns early.
+    $schedulerPath = Join-Path -Path $PSScriptRoot -ChildPath '..\Register-MaintenanceTask.ps1'
+    # Dot-sourcing loads the functions only; the entry points return early.
     . $scriptPath
+    . $schedulerPath
 
     function Get-TestVersionInfo {
         param([int] $Build, [string] $EditionId, [string] $InstallationType = 'Client', [string] $ProductName = '')
@@ -48,7 +50,10 @@ Describe 'Documentation' {
         $repoRoot = (Resolve-Path -Path (Join-Path -Path $PSScriptRoot -ChildPath '..')).ProviderPath
         $readmeFiles = @(Get-Item -LiteralPath (Join-Path $repoRoot 'README.md')) +
             @(Get-ChildItem -Path (Join-Path $repoRoot 'docs') -Filter 'README.*.md')
-        $markdownFiles = $readmeFiles + @(Get-Item -LiteralPath (Join-Path $repoRoot 'CONTRIBUTING.md'))
+        $markdownFiles = $readmeFiles + @(
+            Get-Item -LiteralPath (Join-Path $repoRoot 'CONTRIBUTING.md')
+            Get-Item -LiteralPath (Join-Path $repoRoot 'SECURITY.md')
+        )
         $readmeCases = $readmeFiles | ForEach-Object { @{ Name = $_.Name; Path = $_.FullName } }
         $markdownCases = $markdownFiles | ForEach-Object { @{ Name = $_.Name; Path = $_.FullName } }
     }
@@ -181,12 +186,15 @@ Describe 'Get-WindowsLifecycleStatus' {
 
 Describe 'Get-WinGetResult' {
     It 'treats exit code <ExitCode> as <ExpectedStatus>' -ForEach @(
-        @{ ExitCode = 0; ExpectedStatus = 'Success' }
-        @{ ExitCode = -1978335189; ExpectedStatus = 'Success' }   # 0x8A15002B no applicable upgrade
-        @{ ExitCode = -1978335212; ExpectedStatus = 'Success' }   # 0x8A150014 no packages found
-        @{ ExitCode = 1; ExpectedStatus = 'Warning' }
+        @{ ExitCode = 0; ExpectedStatus = 'Success'; Reboot = $false }
+        @{ ExitCode = 3010; ExpectedStatus = 'Success'; Reboot = $true }        # reboot required
+        @{ ExitCode = -1978335189; ExpectedStatus = 'Success'; Reboot = $false } # 0x8A15002B no applicable upgrade
+        @{ ExitCode = -1978335212; ExpectedStatus = 'Success'; Reboot = $false } # 0x8A150014 no packages found
+        @{ ExitCode = 1; ExpectedStatus = 'Warning'; Reboot = $false }
     ) {
-        (Get-WinGetResult -ExitCode $ExitCode).Status | Should -Be $ExpectedStatus
+        $result = Get-WinGetResult -ExitCode $ExitCode
+        $result.Status | Should -Be $ExpectedStatus
+        $result.RebootRequired | Should -Be $Reboot
     }
 
     It 'shows unknown exit codes in hexadecimal' {
@@ -233,5 +241,110 @@ Describe 'Clear-StaleFile' {
 
     It 'handles a missing folder' {
         (Clear-StaleFile -Path (Join-Path $TestDrive 'missing') -OlderThan (Get-Date)).BytesFreed | Should -Be 0
+    }
+
+    It 'does not follow directory junctions (reparse points)' {
+        $tempRoot = Join-Path -Path $TestDrive -ChildPath 'temp-junction-test'
+        $externalDir = Join-Path -Path $TestDrive -ChildPath 'external-protected'
+        $null = New-Item -Path $tempRoot -ItemType Directory -Force
+        $null = New-Item -Path $externalDir -ItemType Directory -Force
+        $externalFile = New-Item -Path (Join-Path $externalDir 'keep.txt') -ItemType File -Value 'important'
+        $externalFile.LastWriteTime = (Get-Date).AddDays(-30)
+
+        $junctionPath = Join-Path -Path $tempRoot -ChildPath 'link'
+        $null = New-Item -ItemType Junction -Path $junctionPath -Target $externalDir
+
+        try {
+            $result = Clear-StaleFile -Path $tempRoot -OlderThan (Get-Date).AddDays(-2)
+            $result.BytesFreed | Should -Be 0
+            Test-Path -LiteralPath $externalFile.FullName | Should -BeTrue
+        }
+        finally {
+            if (Test-Path -LiteralPath $junctionPath) {
+                [System.IO.Directory]::Delete($junctionPath)
+            }
+        }
+    }
+}
+
+Describe 'Invoke-CleanupStep' {
+    It 'marks RebootRequired when DISM /StartComponentCleanup exits with 3010' {
+        Mock Invoke-NativeCommand { return 3010 }
+        Mock Get-TempFolderPath { return @() }
+        Mock Get-Command { return $null } -ParameterFilter { $Name -eq 'Delete-DeliveryOptimizationCache' }
+
+        $result = Invoke-CleanupStep -TempFileAgeDays 2
+
+        $result.Status | Should -Be 'Success'
+        $result.RebootRequired | Should -BeTrue
+    }
+}
+
+Describe 'Invoke-RepairStep' {
+    It 'records RebootRequired for DISM 3010 and warns when SFC returns non-zero' {
+        Mock Invoke-NativeCommand {
+            if ($FilePath -like '*dism.exe') { return 3010 }
+            return 1
+        }
+
+        $result = Invoke-RepairStep
+
+        $result.Status | Should -Be 'Warning'
+        $result.RebootRequired | Should -BeTrue
+        $result.Message | Should -Match 'verification failed or unrepairable'
+    }
+}
+
+Describe 'Invoke-UpgradeReadinessStep' {
+    It 'falls back to Win32_ComputerSystem RAM on VMs and handles malformed TPM SpecVersion' {
+        Mock Get-CimInstance {
+            param($ClassName)
+            switch ($ClassName) {
+                'Win32_Tpm' { return [pscustomobject]@{ SpecVersion = 'invalid' } }
+                'Win32_PhysicalMemory' { return @() }
+                'Win32_ComputerSystem' { return [pscustomobject]@{ TotalPhysicalMemory = 8GB } }
+                'Win32_Processor' { return [pscustomobject]@{ Name = $null; AddressWidth = 64; NumberOfCores = 4; MaxClockSpeed = 2400 } }
+            }
+        }
+        Mock Get-ItemProperty { return [pscustomobject]@{ UEFISecureBootEnabled = 1 } }
+        Mock Get-Partition { return $null }
+        Mock Out-Host {}
+
+        $result = Invoke-UpgradeReadinessStep
+
+        $result.Status | Should -Be 'Warning'
+        $result.Message | Should -Match 'TPM 2\.0'
+        $result.Message | Should -Not -Match 'RAM'
+        $result.Message | Should -Not -Match 'CPU'
+    }
+}
+
+Describe 'Register-MaintenanceTask helpers' {
+    It 'accepts safe MaintenanceArguments: <Args>' -ForEach @(
+        @{ Args = '' }
+        @{ Args = '-Skip Repair, Defender' }
+        @{ Args = "-Only WinGet, WindowsUpdate -LogDirectory 'C:\Logs'" }
+    ) {
+        Test-SafeMaintenanceArguments -Arguments $Args | Should -BeTrue
+    }
+
+    It 'rejects unsafe MaintenanceArguments: <Args>' -ForEach @(
+        @{ Args = '-Skip Repair; calc.exe' }
+        @{ Args = '$(whoami)' }
+        @{ Args = '-Skip Repair | Out-Null' }
+        @{ Args = '-Skip Repair & calc.exe' }
+        @{ Args = '-LogDirectory "C:\Logs"' }
+    ) {
+        Test-SafeMaintenanceArguments -Arguments $Args | Should -BeFalse
+    }
+
+    It 'detects user-writable paths inside the user profile' {
+        $userPath = Join-Path -Path $env:USERPROFILE -ChildPath 'Invoke-WindowsMaintenance.ps1'
+        Test-IsPathUserWritable -Path $userPath | Should -BeTrue
+    }
+
+    It 'does not flag System32 binaries as user-writable' {
+        $sysBinary = Join-Path -Path $env:SystemRoot -ChildPath 'System32\cmd.exe'
+        Test-IsPathUserWritable -Path $sysBinary | Should -BeFalse
     }
 }

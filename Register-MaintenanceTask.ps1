@@ -68,7 +68,7 @@ param(
     [string] $At = '10:00',
 
     [Parameter(ParameterSetName = 'Register')]
-    [string] $ScriptPath = (Join-Path -Path $PSScriptRoot -ChildPath 'Invoke-WindowsMaintenance.ps1'),
+    [string] $ScriptPath = '',
 
     [Parameter(ParameterSetName = 'Register')]
     [string] $MaintenanceArguments = '',
@@ -81,6 +81,88 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Test-IsPathUserWritable {
+    <#
+        Returns $true if the file or its parent directory grants write/modify permissions
+        to standard non-admin principals (Users, Authenticated Users, Everyone), or if
+        the path is inside the current user's profile.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Path
+    )
+
+    if ($env:USERPROFILE -and $Path -like "$env:USERPROFILE\*") {
+        return $true
+    }
+
+    $untrustedSids = @(
+        'S-1-1-0'      # Everyone
+        'S-1-5-11'     # Authenticated Users
+        'S-1-5-32-545' # BUILTIN\Users
+    )
+    # Atomic write/takeover bits only (composite values like Modify/FullControl include Read bits).
+    $writeRights = [System.Security.AccessControl.FileSystemRights](
+        [System.Security.AccessControl.FileSystemRights]::WriteData -bor
+        [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+        [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+        [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+        [System.Security.AccessControl.FileSystemRights]::Delete -bor
+        [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+    )
+
+    $targets = @($Path)
+    $parent = Split-Path -Path $Path -Parent
+    if ($parent) { $targets += $parent }
+
+    foreach ($target in $targets) {
+        try {
+            $acl = Get-Acl -LiteralPath $target -ErrorAction Stop
+            foreach ($rule in $acl.Access) {
+                if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+                $sid = $null
+                try {
+                    $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                }
+                catch {
+                    continue
+                }
+                if ($sid -in $untrustedSids -and (($rule.FileSystemRights -band $writeRights) -ne 0)) {
+                    return $true
+                }
+            }
+        }
+        catch {
+            Write-Verbose "Could not inspect ACL for ${target}: $($_.Exception.Message)"
+        }
+    }
+
+    $false
+}
+
+function Test-SafeMaintenanceArguments {
+    <#
+        Rejects shell metacharacters (;, |, &, `, $, (), <>, ", newlines) so that
+        -MaintenanceArguments cannot inject extra commands into the elevated task.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowEmptyString()]
+        [string] $Arguments = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Arguments)) { return $true }
+    $Arguments -notmatch '[;|&`$()<>"\r\n]'
+}
+
+# When dot-sourced (for example by the Pester tests) only the helpers are loaded.
+if ($MyInvocation.InvocationName -eq '.') { return }
 
 $principalCheck = New-Object -TypeName Security.Principal.WindowsPrincipal -ArgumentList ([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principalCheck.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -99,9 +181,16 @@ if ($Unregister) {
     return
 }
 
+if (-not (Test-SafeMaintenanceArguments -Arguments $MaintenanceArguments)) {
+    throw 'MaintenanceArguments contains disallowed shell metacharacters (;, |, &, `, $, (), <>, ", or newlines).'
+}
+
+if (-not $ScriptPath) {
+    $ScriptPath = Join-Path -Path $PSScriptRoot -ChildPath 'Invoke-WindowsMaintenance.ps1'
+}
 $resolvedScript = (Resolve-Path -LiteralPath $ScriptPath).ProviderPath
-if ($resolvedScript -like "$env:USERPROFILE\*") {
-    Write-Warning ("The script is inside your user profile ({0}). Because the task runs elevated, move it to a folder only administrators can modify, e.g. C:\Program Files\WindowsHealthAndUpdate." -f $resolvedScript)
+if (Test-IsPathUserWritable -Path $resolvedScript) {
+    Write-Warning ("The script or its folder is writable by standard users ({0}). Because the task runs elevated, move it to a folder only administrators can modify, e.g. C:\Program Files\WindowsHealthAndUpdate." -f $resolvedScript)
 }
 
 $powershell = Join-Path -Path $env:SystemRoot -ChildPath 'System32\WindowsPowerShell\v1.0\powershell.exe'

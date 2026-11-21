@@ -29,9 +29,9 @@ It **detects the exact Windows release** (for example *Windows 11 Pro 25H2*, *Wi
 | Step | What it does |
 | --- | --- |
 | `RestorePoint` | Creates a System Restore point before anything changes. |
-| `WinGet` | Upgrades installed applications silently with `winget`. It finds winget even when it is not on `PATH` (SYSTEM account, a different admin user). |
+| `WinGet` | Upgrades installed applications with known versions silently with `winget` (accepts package/source agreements automatically). Finds winget even when it is not on `PATH` (SYSTEM account, a different admin user). |
 | `Store` | Triggers a Microsoft Store app update scan. |
-| `WindowsUpdate` | Searches, downloads and **installs** updates through the Windows Update Agent API. Drivers and feature updates are opt-in. |
+| `WindowsUpdate` | Searches, downloads and **installs** updates through the Windows Update Agent API (accepts update EULAs automatically). Drivers and feature updates are opt-in. Note: the WUA API blocks remote WinRM/SSH sessions (`0x80070005`); run locally or via a scheduled task. |
 | `Defender` | Updates Microsoft Defender signatures and runs a quick scan. Skipped when another antivirus is active. |
 | `Repair` | `DISM /RestoreHealth` followed by `sfc /scannow`. |
 | `Cleanup` | `DISM /StartComponentCleanup`, temp files older than N days for every local profile, Delivery Optimization cache. Reports the space freed. |
@@ -160,7 +160,7 @@ Get-Help .\Invoke-WindowsMaintenance.ps1 -Detailed
 .\Register-MaintenanceTask.ps1 -Unregister
 ```
 
-> **Security:** the task runs the script with administrator rights. Keep it in a folder standard users cannot modify (such as `C:\Program Files\...`). Otherwise any process running as your user could edit the script and gain elevation. The registration script warns you when the script is inside your user profile.
+> **Security:** the task runs the script with administrator rights. Keep it in a folder standard users cannot modify (such as `C:\Program Files\...`). Otherwise any process running as your user could edit the script and gain elevation. The registration script checks the folder/file ACLs and warns you when standard users have write access. See [SECURITY.md](SECURITY.md) for more details.
 
 ## Logs and report
 

@@ -119,7 +119,7 @@ $ScriptVersion = '2.0.0'
 
 #region Output helpers ---------------------------------------------------------
 
-function Write-Log {
+function Write-MaintenanceLog {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Interactive tool: colored console output, captured by Start-Transcript.')]
     [CmdletBinding()]
     param(
@@ -497,7 +497,7 @@ function Invoke-NativeCommand {
         [string[]] $ArgumentList = @()
     )
 
-    Write-Log ('> {0} {1}' -f (Split-Path -Path $FilePath -Leaf), ($ArgumentList -join ' ')) -Level Detail
+    Write-MaintenanceLog ('> {0} {1}' -f (Split-Path -Path $FilePath -Leaf), ($ArgumentList -join ' ')) -Level Detail
 
     $startArgs = @{ FilePath = $FilePath; NoNewWindow = $true; Wait = $true; PassThru = $true }
     if ($ArgumentList.Count -gt 0) { $startArgs.ArgumentList = $ArgumentList }
@@ -541,6 +541,7 @@ function Get-WinGetResult {
 
     switch ($ExitCode) {
         0 { return (New-StepResult -Status Success -Message 'Applications are up to date.') }
+        3010 { return (New-StepResult -Status Success -Message 'Applications upgraded; a restart is required to finish.' -RebootRequired) }
         -1978335212 { return (New-StepResult -Status Success -Message 'No installed applications matched (0x8A150014).') }
         -1978335189 { return (New-StepResult -Status Success -Message 'No applicable upgrades found (0x8A15002B).') }
         default {
@@ -564,7 +565,7 @@ function Get-LatestRestorePointSequence {
         if ($latest) { return [int]$latest.SequenceNumber }
     }
     catch {
-        Write-Log "Restore points could not be listed: $($_.Exception.Message)" -Level Detail
+        Write-MaintenanceLog "Restore points could not be listed: $($_.Exception.Message)" -Level Detail
     }
     0
 }
@@ -604,18 +605,29 @@ function Invoke-WinGetStep {
     }
 
     $version = [version]'0.0'
-    $versionText = (& $winget --version | Select-Object -First 1) -replace '^v', '' -replace '[^0-9.].*$', ''
-    $null = [version]::TryParse($versionText, [ref]$version)
-    Write-Log "winget $version at $winget" -Level Detail
+    try {
+        $rawVersion = & $winget --version 2>$null | Select-Object -First 1
+        if ($LASTEXITCODE -eq 0 -and $rawVersion) {
+            $versionText = $rawVersion -replace '^v', '' -replace '[^0-9.].*$', ''
+            $null = [version]::TryParse($versionText, [ref]$version)
+        }
+    }
+    catch {
+        Write-MaintenanceLog "Could not read winget version: $($_.Exception.Message)" -Level Detail
+    }
+    Write-MaintenanceLog "winget $version at $winget" -Level Detail
 
-    $null = Invoke-NativeCommand -FilePath $winget -ArgumentList @('source', 'update')
+    $sourceUpdateCode = Invoke-NativeCommand -FilePath $winget -ArgumentList @('source', 'update')
+    if ($sourceUpdateCode -ne 0) {
+        Write-MaintenanceLog ('winget source update exited with 0x{0:X8}; continuing with upgrade.' -f $sourceUpdateCode) -Level Warning
+    }
 
     $upgradeArgs = @('upgrade', '--all', '--silent', '--accept-package-agreements', '--accept-source-agreements')
     if ($version -ge [version]'1.4') {
-        $upgradeArgs += @('--include-unknown', '--disable-interactivity')
+        $upgradeArgs += '--disable-interactivity'
     }
     else {
-        Write-Log 'winget is older than 1.4: update "App Installer" for unattended upgrades.' -Level Warning
+        Write-MaintenanceLog 'winget is older than 1.4: update "App Installer" for unattended upgrades.' -Level Warning
     }
 
     Get-WinGetResult -ExitCode (Invoke-NativeCommand -FilePath $winget -ArgumentList $upgradeArgs)
@@ -664,25 +676,25 @@ function Invoke-WindowsUpdateStep {
     $criteria = 'IsInstalled=0 and IsHidden=0'
     if (-not $IncludeDrivers) { $criteria += " and Type='Software'" }
 
-    Write-Log "Searching Windows Update ($criteria)..."
+    Write-MaintenanceLog "Searching Windows Update ($criteria)..."
     $search = $session.CreateUpdateSearcher().Search($criteria)
 
     $toInstall = New-Object -ComObject 'Microsoft.Update.UpdateColl'
     foreach ($update in $search.Updates) {
         if ($update.BrowseOnly) {
-            Write-Log "Optional, not installed: $($update.Title)" -Level Detail
+            Write-MaintenanceLog "Optional, not installed: $($update.Title)" -Level Detail
             continue
         }
         if (-not $IncludeFeatureUpdates -and (Test-IsFeatureUpdate -Update $update)) {
-            Write-Log "Feature update, not installed (use -IncludeFeatureUpdates): $($update.Title)" -Level Warning
+            Write-MaintenanceLog "Feature update, not installed (use -IncludeFeatureUpdates): $($update.Title)" -Level Warning
             continue
         }
         if ($update.InstallationBehavior.CanRequestUserInput) {
-            Write-Log "Needs user input, install it from Settings: $($update.Title)" -Level Warning
+            Write-MaintenanceLog "Needs user input, install it from Settings: $($update.Title)" -Level Warning
             continue
         }
         if (-not $update.EulaAccepted) { $update.AcceptEula() }
-        Write-Log "Queued: $($update.Title)"
+        Write-MaintenanceLog "Queued: $($update.Title)"
         $null = $toInstall.Add($update)
     }
 
@@ -690,47 +702,74 @@ function Invoke-WindowsUpdateStep {
         return (New-StepResult -Status Success -Message 'No pending updates.')
     }
 
-    Write-Log "Downloading $($toInstall.Count) update(s)..."
+    Write-MaintenanceLog "Downloading $($toInstall.Count) update(s)..."
     $downloader = $session.CreateUpdateDownloader()
     $downloader.Updates = $toInstall
-    $null = $downloader.Download()
+    try {
+        $null = $downloader.Download()
+    }
+    catch [System.Runtime.InteropServices.COMException] {
+        if ($_.Exception.HResult -eq -2147024891) {
+            return (New-StepResult -Status Failed -Message 'Windows Update download denied (0x80070005). The Windows Update Agent API blocks remote sessions (WinRM/SSH); run locally or via a scheduled task.')
+        }
+        throw
+    }
 
     $downloaded = New-Object -ComObject 'Microsoft.Update.UpdateColl'
     foreach ($update in $toInstall) {
         if ($update.IsDownloaded) { $null = $downloaded.Add($update) }
-        else { Write-Log "Download failed: $($update.Title)" -Level Warning }
+        else { Write-MaintenanceLog "Download failed: $($update.Title)" -Level Warning }
     }
+    $downloadFailed = $toInstall.Count - $downloaded.Count
     if ($downloaded.Count -eq 0) {
         return (New-StepResult -Status Failed -Message 'Updates were found but none could be downloaded. Check the network connection and try again.')
     }
 
-    Write-Log "Installing $($downloaded.Count) update(s)..."
+    Write-MaintenanceLog "Installing $($downloaded.Count) update(s)..."
     $installer = $session.CreateUpdateInstaller()
     $installer.Updates = $downloaded
-    $installResult = $installer.Install()
+    try {
+        $installResult = $installer.Install()
+    }
+    catch [System.Runtime.InteropServices.COMException] {
+        if ($_.Exception.HResult -eq -2147024891) {
+            return (New-StepResult -Status Failed -Message 'Windows Update install denied (0x80070005). The Windows Update Agent API blocks remote sessions (WinRM/SSH); run locally or via a scheduled task.')
+        }
+        throw
+    }
 
     # OperationResultCode: 2 = Succeeded, 3 = SucceededWithErrors, 4 = Failed, 5 = Aborted
     $succeeded = 0
+    $succeededWithErrors = 0
     $failed = 0
     for ($i = 0; $i -lt $downloaded.Count; $i++) {
         $title = $downloaded.Item($i).Title
         $code = $installResult.GetUpdateResult($i).ResultCode
-        if ($code -in 2, 3) {
+        if ($code -eq 2) {
             $succeeded++
-            Write-Log "Installed: $title" -Level Success
+            Write-MaintenanceLog "Installed: $title" -Level Success
+        }
+        elseif ($code -eq 3) {
+            $succeededWithErrors++
+            Write-MaintenanceLog "Installed with errors: $title" -Level Warning
         }
         else {
             $failed++
-            Write-Log "Failed (result code $code): $title" -Level Error
+            Write-MaintenanceLog "Failed (result code $code): $title" -Level Error
         }
     }
 
-    $summary = "$succeeded installed, $failed failed."
+    $summaryParts = @("$succeeded installed")
+    if ($succeededWithErrors -gt 0) { $summaryParts += "$succeededWithErrors installed with errors" }
+    if ($downloadFailed -gt 0) { $summaryParts += "$downloadFailed download failed" }
+    $summaryParts += "$failed failed"
+    $summary = ($summaryParts -join ', ') + '.'
+
     $reboot = [bool]$installResult.RebootRequired
-    if ($failed -gt 0 -and $succeeded -eq 0) {
+    if ($failed -gt 0 -and $succeeded -eq 0 -and $succeededWithErrors -eq 0) {
         return (New-StepResult -Status Failed -Message $summary -RebootRequired:$reboot)
     }
-    if ($failed -gt 0) {
+    if ($failed -gt 0 -or $downloadFailed -gt 0 -or $succeededWithErrors -gt 0) {
         return (New-StepResult -Status Warning -Message $summary -RebootRequired:$reboot)
     }
     New-StepResult -Status Success -Message $summary -RebootRequired:$reboot
@@ -757,15 +796,15 @@ function Invoke-DefenderStep {
         return (New-StepResult -Status Skipped -Message "Defender is not the primary antivirus (mode: $mode). Use your antivirus tools instead.")
     }
 
-    Write-Log 'Updating Defender signatures...'
+    Write-MaintenanceLog 'Updating Defender signatures...'
     try {
         Update-MpSignature -ErrorAction Stop
     }
     catch {
-        Write-Log "Signature update failed: $(Format-ErrorRecord -ErrorRecord $_)" -Level Warning
+        Write-MaintenanceLog "Signature update failed: $(Format-ErrorRecord -ErrorRecord $_)" -Level Warning
     }
 
-    Write-Log 'Running a quick scan...'
+    Write-MaintenanceLog 'Running a quick scan...'
     Start-MpScan -ScanType QuickScan -ErrorAction Stop
 
     $status = Get-MpComputerStatus
@@ -786,7 +825,7 @@ function Invoke-RepairStep {
     $issues = @()
     $reboot = $false
 
-    Write-Log 'DISM /RestoreHealth can take 10-30 minutes.'
+    Write-MaintenanceLog 'DISM /RestoreHealth can take 10-30 minutes.'
     $dismCode = Invoke-NativeCommand -FilePath (Join-Path -Path $system -ChildPath 'dism.exe') -ArgumentList @('/Online', '/Cleanup-Image', '/RestoreHealth')
     switch ($dismCode) {
         0 { }
@@ -796,7 +835,7 @@ function Invoke-RepairStep {
 
     $sfcCode = Invoke-NativeCommand -FilePath (Join-Path -Path $system -ChildPath 'sfc.exe') -ArgumentList @('/scannow')
     if ($sfcCode -ne 0) {
-        $issues += "SFC exit code ${sfcCode}: integrity violations were found; repaired files are listed in %windir%\Logs\CBS\CBS.log"
+        $issues += "SFC exit code ${sfcCode}: verification failed or unrepairable integrity violations were found (see %windir%\Logs\CBS\CBS.log)"
     }
 
     if ($issues.Count -gt 0) {
@@ -825,7 +864,9 @@ function Get-TempFolderPath {
 function Clear-StaleFile {
     <#
         Deletes files older than -OlderThan below -Path, then removes the folders that
-        became empty. Files in use are skipped and counted.
+        became empty. Skips reparse points (symlinks/junctions) so an elevated run
+        cannot be tricked into deleting files outside -Path. Files in use are skipped
+        and counted.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -839,29 +880,56 @@ function Clear-StaleFile {
 
     $freed = [long]0
     $inUse = 0
+    $reparseFlag = [System.IO.FileAttributes]::ReparsePoint
 
     if (Test-Path -LiteralPath $Path -PathType Container -ErrorAction SilentlyContinue) {
-        $files = Get-ChildItem -LiteralPath $Path -File -Recurse -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTime -lt $OlderThan }
-        foreach ($file in $files) {
-            try {
-                $size = $file.Length
-                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
-                $freed += $size
-            }
-            catch {
-                $inUse++
-            }
-        }
+        $rootAttributes = [System.IO.File]::GetAttributes($Path)
+        if (($rootAttributes -band $reparseFlag) -eq 0) {
+            $stack = New-Object -TypeName System.Collections.Generic.Stack[string]
+            $visitedDirs = New-Object -TypeName System.Collections.Generic.List[object]
+            $stack.Push($Path)
 
-        Get-ChildItem -LiteralPath $Path -Directory -Recurse -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTime -lt $OlderThan } |
-            Sort-Object -Property { $_.FullName.Length } -Descending |
-            ForEach-Object {
-                if (-not (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
-                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+            while ($stack.Count -gt 0) {
+                $currentDir = $stack.Pop()
+                $children = Get-ChildItem -LiteralPath $currentDir -Force -ErrorAction SilentlyContinue
+                foreach ($child in $children) {
+                    if (($child.Attributes -band $reparseFlag) -ne 0) { continue }
+
+                    if ($child.PSIsContainer) {
+                        $stack.Push($child.FullName)
+                        $visitedDirs.Add([pscustomobject]@{
+                                FullName      = $child.FullName
+                                LastWriteTime = $child.LastWriteTime
+                            })
+                    }
+                    elseif ($child.LastWriteTime -lt $OlderThan) {
+                        try {
+                            $size = $child.Length
+                            Remove-Item -LiteralPath $child.FullName -Force -ErrorAction Stop
+                            $freed += $size
+                        }
+                        catch {
+                            $inUse++
+                        }
+                    }
                 }
             }
+
+            $visitedDirs |
+                Where-Object { $_.LastWriteTime -lt $OlderThan } |
+                Sort-Object -Property { $_.FullName.Length } -Descending |
+                ForEach-Object {
+                    try {
+                        if (([System.IO.File]::GetAttributes($_.FullName) -band $reparseFlag) -ne 0) { return }
+                        if (-not (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+                            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                    catch {
+                        Write-MaintenanceLog "Could not remove empty directory $($_.FullName): $($_.Exception.Message)" -Level Detail
+                    }
+                }
+        }
     }
 
     [pscustomobject]@{ Path = $Path; BytesFreed = $freed; FilesInUse = $inUse }
@@ -875,19 +943,23 @@ function Invoke-CleanupStep {
 
     $notes = @()
     $warnings = @()
+    $reboot = $false
 
     # /ResetBase is deliberately not used: it would make installed updates impossible to uninstall.
     $dism = Join-Path -Path (Get-NativeSystemPath) -ChildPath 'dism.exe'
     $dismCode = Invoke-NativeCommand -FilePath $dism -ArgumentList @('/Online', '/Cleanup-Image', '/StartComponentCleanup')
-    if ($dismCode -eq 0) { $notes += 'component store cleaned' }
-    else { $warnings += ('component cleanup exit code 0x{0:X8}' -f $dismCode) }
+    switch ($dismCode) {
+        0 { $notes += 'component store cleaned' }
+        3010 { $notes += 'component store cleaned (restart required)'; $reboot = $true }
+        default { $warnings += ('component cleanup exit code 0x{0:X8}' -f $dismCode) }
+    }
 
     $cutoff = (Get-Date).AddDays(-$TempFileAgeDays)
     $totalFreed = [long]0
     $totalInUse = 0
     foreach ($path in Get-TempFolderPath) {
         $result = Clear-StaleFile -Path $path -OlderThan $cutoff
-        Write-Log ('{0}: {1:N1} MB freed' -f $path, ($result.BytesFreed / 1MB)) -Level Detail
+        Write-MaintenanceLog ('{0}: {1:N1} MB freed' -f $path, ($result.BytesFreed / 1MB)) -Level Detail
         $totalFreed += $result.BytesFreed
         $totalInUse += $result.FilesInUse
     }
@@ -906,9 +978,9 @@ function Invoke-CleanupStep {
 
     $message = ($notes + $warnings) -join '; '
     if ($warnings.Count -gt 0) {
-        return (New-StepResult -Status Warning -Message $message)
+        return (New-StepResult -Status Warning -Message $message -RebootRequired:$reboot)
     }
-    New-StepResult -Status Success -Message $message
+    New-StepResult -Status Success -Message $message -RebootRequired:$reboot
 }
 
 function Invoke-DiskHealthStep {
@@ -927,7 +999,7 @@ function Invoke-DiskHealthStep {
             $counters = $disk | Get-StorageReliabilityCounter -ErrorAction Stop
         }
         catch {
-            Write-Log "Reliability counters unavailable for $($disk.FriendlyName)." -Level Detail
+            Write-MaintenanceLog "Reliability counters unavailable for $($disk.FriendlyName)." -Level Detail
         }
 
         if ($disk.HealthStatus -ne 'Healthy') {
@@ -996,11 +1068,12 @@ function Invoke-UpgradeReadinessStep {
         $tpm = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftTpm' -ClassName 'Win32_Tpm' -ErrorAction Stop
     }
     catch {
-        Write-Log 'TPM information unavailable.' -Level Detail
+        Write-MaintenanceLog 'TPM information unavailable.' -Level Detail
     }
     $tpmVersion = $null
     if ($tpm -and $tpm.SpecVersion) { $tpmVersion = ($tpm.SpecVersion -split ',')[0].Trim() }
-    $tpmOk = $tpmVersion -and ([version]$tpmVersion -ge [version]'2.0')
+    $parsedTpmVersion = $null
+    $tpmOk = $tpmVersion -and [version]::TryParse($tpmVersion, [ref]$parsedTpmVersion) -and ($parsedTpmVersion -ge [version]'2.0')
     $checks += [pscustomobject]@{ Requirement = 'TPM 2.0'; Found = $(if ($tpmVersion) { "TPM $tpmVersion" } else { 'not found' }); Pass = [bool]$tpmOk }
 
     # The SecureBoot\State key only exists on UEFI systems.
@@ -1013,7 +1086,13 @@ function Invoke-UpgradeReadinessStep {
         $checks += [pscustomobject]@{ Requirement = 'UEFI + Secure Boot'; Found = $(if ($enabled) { 'enabled' } else { 'UEFI, Secure Boot off' }); Pass = $enabled }
     }
 
-    $memoryGB = [math]::Round(((Get-CimInstance -ClassName 'Win32_PhysicalMemory' | Measure-Object -Property Capacity -Sum).Sum) / 1GB, 1)
+    # Win32_PhysicalMemory can be empty on VMs (e.g. Hyper-V dynamic memory); fall back to Win32_ComputerSystem.
+    $totalMemoryBytes = (Get-CimInstance -ClassName 'Win32_PhysicalMemory' -ErrorAction SilentlyContinue | Measure-Object -Property Capacity -Sum).Sum
+    if (-not $totalMemoryBytes) {
+        $computerSystem = Get-CimInstance -ClassName 'Win32_ComputerSystem' -ErrorAction SilentlyContinue
+        if ($computerSystem) { $totalMemoryBytes = $computerSystem.TotalPhysicalMemory }
+    }
+    $memoryGB = if ($totalMemoryBytes) { [math]::Round($totalMemoryBytes / 1GB, 1) } else { 0 }
     $checks += [pscustomobject]@{ Requirement = 'RAM >= 4 GB'; Found = "$memoryGB GB"; Pass = $memoryGB -ge 4 }
 
     $systemDisk = Get-Partition -DriveLetter $env:SystemDrive.TrimEnd(':') -ErrorAction SilentlyContinue | Get-Disk -ErrorAction SilentlyContinue
@@ -1022,9 +1101,17 @@ function Invoke-UpgradeReadinessStep {
         $checks += [pscustomobject]@{ Requirement = 'Storage >= 64 GB'; Found = "$diskGB GB"; Pass = $systemDisk.Size -ge 64e9 }
     }
 
-    $cpu = Get-CimInstance -ClassName 'Win32_Processor' | Select-Object -First 1
-    $cpuOk = $cpu.AddressWidth -eq 64 -and $cpu.NumberOfCores -ge 2 -and $cpu.MaxClockSpeed -ge 1000
-    $checks += [pscustomobject]@{ Requirement = '64-bit CPU, 2+ cores, 1 GHz+'; Found = "$($cpu.Name.Trim()) ($($cpu.NumberOfCores) cores)"; Pass = $cpuOk }
+    $cpus = @(Get-CimInstance -ClassName 'Win32_Processor' -ErrorAction SilentlyContinue)
+    $cpu = $cpus | Select-Object -First 1
+    if ($cpu) {
+        $totalCores = ($cpus | Measure-Object -Property NumberOfCores -Sum).Sum
+        $cpuName = if ($cpu.Name) { $cpu.Name.Trim() } else { 'Unknown CPU' }
+        $cpuOk = $cpu.AddressWidth -eq 64 -and $totalCores -ge 2 -and $cpu.MaxClockSpeed -ge 1000
+        $checks += [pscustomobject]@{ Requirement = '64-bit CPU, 2+ cores, 1 GHz+'; Found = "$cpuName ($totalCores cores)"; Pass = [bool]$cpuOk }
+    }
+    else {
+        $checks += [pscustomobject]@{ Requirement = '64-bit CPU, 2+ cores, 1 GHz+'; Found = 'unavailable'; Pass = $false }
+    }
 
     $checks | Format-Table -AutoSize | Out-Host
 
@@ -1076,9 +1163,16 @@ function Clear-OldLog {
         [int] $RetentionDays
     )
 
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container -ErrorAction SilentlyContinue)) { return }
+    $reparseFlag = [System.IO.FileAttributes]::ReparsePoint
+    if (([System.IO.File]::GetAttributes($Directory) -band $reparseFlag) -ne 0) { return }
+
     $cutoff = (Get-Date).AddDays(-$RetentionDays)
     Get-ChildItem -LiteralPath $Directory -File -Filter 'maintenance_*' -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt $cutoff } |
+        Where-Object {
+            (($_.Attributes -band $reparseFlag) -eq 0) -and
+            ($_.LastWriteTime -lt $cutoff)
+        } |
         Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
@@ -1089,7 +1183,7 @@ function Clear-OldLog {
 if ($MyInvocation.InvocationName -eq '.') { return }
 
 if (-not (Test-IsAdministrator)) {
-    Write-Log 'Run this script from an elevated PowerShell (right-click > Run as administrator).' -Level Error
+    Write-MaintenanceLog 'Run this script from an elevated PowerShell (right-click > Run as administrator).' -Level Error
     exit 1
 }
 
@@ -1109,24 +1203,26 @@ try {
         $transcriptStarted = $true
     }
     catch {
-        Write-Log "Transcript not started: $($_.Exception.Message)" -Level Warning
+        Write-MaintenanceLog "Transcript not started: $($_.Exception.Message)" -Level Warning
     }
 
-    Clear-OldLog -Directory $LogDirectory -RetentionDays $LogRetentionDays
+    if (-not $WhatIfPreference) {
+        Clear-OldLog -Directory $LogDirectory -RetentionDays $LogRetentionDays
+    }
 
     $os = Get-WindowsVersionInfo
     $lifecycle = Get-WindowsLifecycleStatus -VersionInfo $os
 
-    Write-Log "Windows Health & Update v$ScriptVersion" -Level Header
-    Write-Log ('System     : {0}, version {1} (OS build {2}, {3})' -f $os.Name, $lifecycle.Release, $os.OsBuild, $os.Architecture)
+    Write-MaintenanceLog "Windows Health & Update v$ScriptVersion" -Level Header
+    Write-MaintenanceLog ('System     : {0}, version {1} (OS build {2}, {3})' -f $os.Name, $lifecycle.Release, $os.OsBuild, $os.Architecture)
     $supportLevel = @{ Supported = 'Success'; EndingSoon = 'Warning'; EndOfSupport = 'Error'; Unknown = 'Warning' }[$lifecycle.Status]
-    Write-Log ('Support    : {0}' -f $lifecycle.Message) -Level $supportLevel
-    Write-Log ('PowerShell : {0} ({1}-bit)' -f $PSVersionTable.PSVersion, $(if ([Environment]::Is64BitProcess) { 64 } else { 32 }))
-    Write-Log ('Logs       : {0}' -f $LogDirectory)
+    Write-MaintenanceLog ('Support    : {0}' -f $lifecycle.Message) -Level $supportLevel
+    Write-MaintenanceLog ('PowerShell : {0} ({1}-bit)' -f $PSVersionTable.PSVersion, $(if ([Environment]::Is64BitProcess) { 64 } else { 32 }))
+    Write-MaintenanceLog ('Logs       : {0}' -f $LogDirectory)
 
     $pendingBefore = @(Get-PendingRebootReason)
     if ($pendingBefore.Count -gt 0) {
-        Write-Log ('A restart was already pending ({0}). Some updates and repairs may only finish after restarting.' -f ($pendingBefore -join ', ')) -Level Warning
+        Write-MaintenanceLog ('A restart was already pending ({0}). Some updates and repairs may only finish after restarting.' -f ($pendingBefore -join ', ')) -Level Warning
     }
 
     # Each step can declare why it does not apply to the detected Windows release.
@@ -1189,7 +1285,7 @@ try {
         elseif ($step.Name -in $Skip) { $skipReason = 'Skipped with -Skip.' }
         elseif ($step.NotApplicable) { $skipReason = "Not applicable: $($step.NotApplicable)" }
 
-        Write-Log ('[{0}/{1}] {2}' -f $index, $steps.Count, $step.Title) -Level Header
+        Write-MaintenanceLog ('[{0}/{1}] {2}' -f $index, $steps.Count, $step.Title) -Level Header
 
         if (-not $skipReason -and -not $PSCmdlet.ShouldProcess($step.Title)) {
             $skipReason = 'Not run (-WhatIf or declined).'
@@ -1205,7 +1301,7 @@ try {
         if ($result.RebootRequired -and -not $rebootReasons.Contains($step.Name)) { $rebootReasons.Add($step.Name) }
 
         $level = @{ Success = 'Success'; Warning = 'Warning'; Failed = 'Error'; Skipped = 'Detail' }[$result.Status]
-        Write-Log $result.Message -Level $level
+        Write-MaintenanceLog $result.Message -Level $level
 
         $results.Add([pscustomobject]@{
                 Step     = $step.Name
@@ -1220,10 +1316,10 @@ try {
     }
     $rebootRequired = $rebootReasons.Count -gt 0
 
-    Write-Log 'Summary' -Level Header
+    Write-MaintenanceLog 'Summary' -Level Header
     foreach ($row in $results) {
         $level = @{ Success = 'Success'; Warning = 'Warning'; Failed = 'Error'; Skipped = 'Detail' }[$row.Status]
-        Write-Log ('{0,-17} {1,-8} {2}  {3}' -f $row.Step, $row.Status, $row.Duration, $row.Message) -Level $level
+        Write-MaintenanceLog ('{0,-17} {1,-8} {2}  {3}' -f $row.Step, $row.Status, $row.Duration, $row.Message) -Level $level
     }
 
     if (@($results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0) {
@@ -1255,20 +1351,20 @@ try {
         exitCode       = $exitCode
     }
     $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $reportPath -Encoding UTF8 -WhatIf:$false -Confirm:$false
-    Write-Log "Report: $reportPath" -Level Detail
+    Write-MaintenanceLog "Report: $reportPath" -Level Detail
 
     if ($rebootRequired) {
         if ($AutoReboot -and $PSCmdlet.ShouldProcess($env:COMPUTERNAME, 'Restart in 2 minutes')) {
-            Write-Log 'Restarting in 2 minutes. Cancel with: shutdown /a' -Level Warning
+            Write-MaintenanceLog 'Restarting in 2 minutes. Cancel with: shutdown /a' -Level Warning
             & (Join-Path -Path (Get-NativeSystemPath) -ChildPath 'shutdown.exe') /r /t 120 /c 'Windows Health & Update: restarting to finish updates.'
         }
         else {
-            Write-Log ('Restart required to finish: {0}.' -f ($rebootReasons -join ', ')) -Level Warning
+            Write-MaintenanceLog ('Restart required to finish: {0}.' -f ($rebootReasons -join ', ')) -Level Warning
         }
     }
 }
 catch {
-    Write-Log "Unexpected error: $(Format-ErrorRecord -ErrorRecord $_)" -Level Error
+    Write-MaintenanceLog "Unexpected error: $(Format-ErrorRecord -ErrorRecord $_)" -Level Error
     $exitCode = 1
 }
 finally {
