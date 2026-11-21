@@ -10,10 +10,10 @@ indent_size = 4
 [*.{ps1,psm1,psd1}]
 end_of_line = crlf
 
-[*.{md,yml}]
+[*.{md,yml,json}]
 end_of_line = lf
 
-[*.yml]
+[*.{yml,json}]
 indent_size = 2
 
 [*.md]

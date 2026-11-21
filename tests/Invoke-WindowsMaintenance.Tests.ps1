@@ -27,6 +27,7 @@ Describe 'Script files' {
     It '<Name> has no syntax errors' -ForEach @(
         @{ Name = 'Invoke-WindowsMaintenance.ps1' }
         @{ Name = 'Register-MaintenanceTask.ps1' }
+        @{ Name = 'scripts\Invoke-HarnessCheck.ps1' }
     ) {
         $path = Join-Path -Path $PSScriptRoot -ChildPath "..\$Name"
         $tokens = $null
@@ -38,6 +39,7 @@ Describe 'Script files' {
     It '<Name> is ASCII-only (Windows PowerShell 5.1 reads BOM-less files as ANSI)' -ForEach @(
         @{ Name = 'Invoke-WindowsMaintenance.ps1' }
         @{ Name = 'Register-MaintenanceTask.ps1' }
+        @{ Name = 'scripts\Invoke-HarnessCheck.ps1' }
     ) {
         $path = Join-Path -Path $PSScriptRoot -ChildPath "..\$Name"
         $nonAscii = [System.IO.File]::ReadAllBytes($path) | Where-Object { $_ -gt 127 }
@@ -53,6 +55,8 @@ Describe 'Documentation' {
         $markdownFiles = $readmeFiles + @(
             Get-Item -LiteralPath (Join-Path $repoRoot 'CONTRIBUTING.md')
             Get-Item -LiteralPath (Join-Path $repoRoot 'SECURITY.md')
+            Get-Item -LiteralPath (Join-Path $repoRoot 'AGENTS.md')
+            Get-Item -LiteralPath (Join-Path $repoRoot 'CLAUDE.md')
         )
         $readmeCases = $readmeFiles | ForEach-Object { @{ Name = $_.Name; Path = $_.FullName } }
         $markdownCases = $markdownFiles | ForEach-Object { @{ Name = $_.Name; Path = $_.FullName } }
