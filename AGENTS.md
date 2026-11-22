@@ -25,6 +25,7 @@ This codebase runs **as Administrator** and registers an elevated scheduled task
 - **No command injection:** Never concatenate unvalidated user strings into elevated command lines. Keep `Test-SafeMaintenanceArgument` strict.
 - **No weakened ACL checks:** Keep `Test-IsPathUserWritable` checking atomic `FileSystemRights` write/takeover bits (`WriteData`, `AppendData`, `Delete`, `ChangePermissions`, `TakeOwnership`, etc.) — never bitwise-OR composite flags like `FullControl` or `Modify`, which include `Read` bits.
 - **Scope boundary (non-destructive by design):** Never add registry "tweaks", debloating, telemetry/service disabling, `DISM /ResetBase`, or deletion of user files, Downloads, or the Recycle Bin.
+- **Single instance:** The entry point takes the `Global\WindowsHealthAndUpdate` lock (`Enter-MaintenanceLock`) right after the elevation check. Never move steps, log directory creation or cleanup before it, and keep the owner check that ignores locks created by untrusted accounts.
 - **Safe agent execution:** Never run `Invoke-WindowsMaintenance.ps1` or `Register-MaintenanceTask.ps1` live without `-WhatIf`, and never execute `shutdown` or destructive system commands unless the user explicitly asks for a live run.
 
 ### 2. PowerShell 5.1 & Encoding Compatibility

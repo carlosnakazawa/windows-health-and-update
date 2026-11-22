@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Added
 
+- Single-instance lock: a manual run that starts while the scheduled task is running (or the other way round) stops before touching anything and exits with `170`. It uses a named mutex in the `Global` namespace, which Windows releases if a run is killed, so no stale lock is left behind; the next run notes that the previous one was interrupted. A lock created by an untrusted account (for example a standard user trying to block maintenance), or one that hides its owner, is ignored with a warning. `-WhatIf` is never blocked. Thanks to community feedback.
+- `lock` in the JSON report: lock status and whether the previous run was interrupted.
+
 - The JSON report lists every Windows update found (`steps[].Details`): title, KB, update ID, result (`Installed`, `InstalledWithErrors`, `Failed`, `Aborted`, `DownloadFailed`, `NotInstalled`), reason, HRESULT and whether it needs a restart. After an unattended run you can tell what was installed, what failed and why. Thanks to community feedback on the overnight-run scenario.
 - `rebootScheduled` in the JSON report: `true` only when `-AutoReboot` actually scheduled the restart.
 - The Windows Update step message names the failed updates and says when a restart is required, for example `1 installed, 1 failed (KB5070002). Restart required.`

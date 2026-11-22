@@ -44,7 +44,8 @@ The script also:
 - isolates every step: a failure is reported and the next step still runs;
 - writes a **transcript** and a **JSON report** to `%ProgramData%\WindowsHealthAndUpdate\Logs`, with retention;
 - supports `-WhatIf` and `-Confirm`;
-- returns exit codes that automation tools understand: `0` success, `1` failure, `3010` restart required;
+- runs **one instance at a time**: if a manual run starts while the scheduled task is running (or the other way round), the second one says so and exits before touching anything;
+- returns exit codes that automation tools understand: `0` success, `1` failure, `3010` restart required, `170` another run already in progress;
 - reports each Windows update individually (title, KB, result, error code, restart need) in the JSON report.
 
 ## Supported Windows versions

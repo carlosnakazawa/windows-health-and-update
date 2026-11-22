@@ -81,3 +81,35 @@ jobs:
           if ($only.Count -ne 2 -or $only -notcontains 'WinGet' -or $only -notcontains 'WindowsUpdate') {
             throw 'The step list was not passed through powershell.exe -File correctly.'
           }
+
+      # A second run while another run holds the lock must stop before touching anything.
+      # It runs for real (no -WhatIf) on the elevated runner; if the lock did not work,
+      # only the read-only DiskHealth step would run and the exit code check would fail.
+      - name: Smoke test (second run while another run holds the lock)
+        run: |
+          $ready = Join-Path $env:RUNNER_TEMP 'lock.ready'
+          $release = Join-Path $env:RUNNER_TEMP 'lock.release'
+          $logs = Join-Path $env:RUNNER_TEMP 'maintenance-logs-locked'
+          $script = (Resolve-Path ./Invoke-WindowsMaintenance.ps1).Path
+          $holderCode = ". '$script'; `$lock = Enter-MaintenanceLock; Set-Content -LiteralPath '$ready' -Value `$lock.Status; while (-not (Test-Path -LiteralPath '$release')) { Start-Sleep -Milliseconds 200 }; Exit-MaintenanceLock -Lock `$lock"
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($holderCode))
+          $holder = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile', '-EncodedCommand', $encoded -PassThru -WindowStyle Hidden
+          try {
+            $deadline = (Get-Date).AddSeconds(60)
+            while (-not (Test-Path -LiteralPath $ready) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+            $holderStatus = Get-Content -LiteralPath $ready -Raw -ErrorAction SilentlyContinue
+            "holder: $holderStatus"
+            if ("$holderStatus".Trim() -ne 'Acquired') { throw 'The holder process did not acquire the lock.' }
+
+            ./Invoke-WindowsMaintenance.ps1 -Only DiskHealth -LogDirectory $logs
+            $code = $LASTEXITCODE
+            "second run exit code: $code"
+            if ($code -ne 170) { throw "Expected exit code 170 (already running), got $code." }
+            if (Test-Path -LiteralPath $logs) { throw 'The blocked run created its log directory; it must stop before touching anything.' }
+            # 170 was the expected result; GitHub Actions ends the step with $LASTEXITCODE.
+            $global:LASTEXITCODE = 0
+          }
+          finally {
+            Set-Content -LiteralPath $release -Value 'release'
+            if (-not $holder.WaitForExit(30000)) { $holder.Kill() }
+          }

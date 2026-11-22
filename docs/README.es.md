@@ -33,7 +33,8 @@ Además, el script:
 - aísla cada paso: un fallo se registra y el siguiente paso se ejecuta igualmente;
 - guarda una **transcripción** y un **informe JSON** en `%ProgramData%\WindowsHealthAndUpdate\Logs`, con retención;
 - admite `-WhatIf` y `-Confirm`;
-- devuelve códigos de salida que entienden las herramientas de automatización: `0` éxito, `1` fallo, `3010` reinicio necesario.
+- se ejecuta **una sola instancia a la vez**: si una ejecución manual empieza mientras la tarea programada está en curso (o al revés), la segunda lo indica y termina antes de tocar nada;
+- devuelve códigos de salida que entienden las herramientas de automatización: `0` éxito, `1` fallo, `3010` reinicio necesario, `170` ya hay otra ejecución en curso.
 
 ## Versiones de Windows compatibles
 
