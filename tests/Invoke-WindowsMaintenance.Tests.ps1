@@ -756,3 +756,130 @@ Describe 'Format-ErrorRecord' {
         Format-ErrorRecord -ErrorRecord $caught | Should -Be 'plain failure'
     }
 }
+
+Describe 'Single-instance lock' {
+    BeforeAll {
+        # A second PowerShell process holds the lock, like a scheduled run in progress.
+        # Modes: Hold (Enter-MaintenanceLock and wait), Abandon (take it and exit without
+        # releasing), Squat (a plain mutex created without this script, as another user would).
+        $holderScript = Join-Path -Path $TestDrive -ChildPath 'Hold-Lock.ps1'
+        Set-Content -LiteralPath $holderScript -Encoding Ascii -Value @'
+param([string] $ScriptPath, [string] $Name, [string] $Mode, [string] $ReadyFile, [string] $ExitFile)
+. $ScriptPath
+switch ($Mode) {
+    'Hold' { $lock = Enter-MaintenanceLock -Name $Name; $status = $lock.Status }
+    'Abandon' { $lock = Enter-MaintenanceLock -Name $Name; $status = $lock.Status }
+    'Squat' { $squat = [System.Threading.Mutex]::new($true, $Name); $status = 'Squatting' }
+}
+Set-Content -LiteralPath $ReadyFile -Value $status
+$deadline = (Get-Date).AddSeconds(60)
+while (-not (Test-Path -LiteralPath $ExitFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+if ($Mode -eq 'Hold') { Exit-MaintenanceLock -Lock $lock }
+# 'Abandon' and 'Squat' exit without releasing; Windows marks the mutex abandoned.
+'@
+
+        function Open-LockHolder {
+            param([string] $Name, [string] $Mode)
+            $id = [guid]::NewGuid().Guid
+            $ready = Join-Path -Path $TestDrive -ChildPath "$id.ready"
+            $exitFile = Join-Path -Path $TestDrive -ChildPath "$id.exit"
+            $exe = (Get-Process -Id $PID).Path
+            $process = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden -ArgumentList @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$holderScript`"",
+                '-ScriptPath', "`"$mainScriptPath`"", '-Name', $Name, '-Mode', $Mode,
+                '-ReadyFile', "`"$ready`"", '-ExitFile', "`"$exitFile`""
+            )
+            $deadline = (Get-Date).AddSeconds(30)
+            while (-not (Test-Path -LiteralPath $ready) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+            [pscustomobject]@{
+                Process  = $process
+                Status   = $(if (Test-Path -LiteralPath $ready) { (Get-Content -LiteralPath $ready -Raw).Trim() } else { 'NotReady' })
+                ExitFile = $exitFile
+            }
+        }
+
+        function Close-LockHolder {
+            param([object] $Holder)
+            if (-not $Holder) { return }
+            Set-Content -LiteralPath $Holder.ExitFile -Value 'exit'
+            if (-not $Holder.Process.WaitForExit(15000)) { $Holder.Process.Kill() }
+        }
+    }
+
+    BeforeEach {
+        # A unique name per test, so tests never collide with a real run or each other.
+        $lockName = 'Global\WindowsHealthAndUpdate-Test-' + [guid]::NewGuid().Guid
+        $holder = $null
+        $lock = $null
+    }
+
+    AfterEach {
+        Exit-MaintenanceLock -Lock $lock
+        Close-LockHolder -Holder $holder
+    }
+
+    It 'acquires a free lock and lets the next run take it after release' {
+        $lock = Enter-MaintenanceLock -Name $lockName
+        $lock.Status | Should -Be 'Acquired'
+        $lock.Abandoned | Should -BeFalse
+        Exit-MaintenanceLock -Lock $lock
+
+        $lock = Enter-MaintenanceLock -Name $lockName
+        $lock.Status | Should -Be 'Acquired'
+    }
+
+    It 'reports Busy while another process holds the lock' {
+        $holder = Open-LockHolder -Name $lockName -Mode Hold
+        $holder.Status | Should -Be 'Acquired'
+
+        $lock = Enter-MaintenanceLock -Name $lockName
+
+        $lock.Status | Should -Be 'Busy'
+        $lock.Mutex | Should -BeNullOrEmpty
+        $lock.Message | Should -Match 'already in progress'
+    }
+
+    It 'takes over and flags a run that ended without releasing the lock' {
+        $holder = Open-LockHolder -Name $lockName -Mode Abandon
+        $holder.Status | Should -Be 'Acquired'
+        # Keep the mutex alive after the holder exits, as a second waiting run would.
+        $keeper = [System.Threading.Mutex]::OpenExisting($lockName)
+        try {
+            Close-LockHolder -Holder $holder
+            $holder = $null
+
+            $lock = Enter-MaintenanceLock -Name $lockName
+
+            $lock.Status | Should -Be 'Acquired'
+            $lock.Abandoned | Should -BeTrue
+            $lock.Message | Should -Match 'ended without finishing'
+        }
+        finally {
+            $keeper.Dispose()
+        }
+    }
+
+    It 'ignores a held lock created by an untrusted account instead of being blocked by it' {
+        # Only SYSTEM is trusted here, so a mutex created and held by this test account
+        # (owned by it, or by Administrators when elevated) plays the role of one created
+        # by a standard user to block maintenance.
+        $holder = Open-LockHolder -Name $lockName -Mode Squat
+        $holder.Status | Should -Be 'Squatting'
+
+        $lock = Enter-MaintenanceLock -Name $lockName -TrustedSid 'S-1-5-18'
+
+        $lock.Status | Should -Be 'Untrusted'
+        $lock.Owner | Should -Not -BeNullOrEmpty
+        $lock.Message | Should -Match 'untrusted account'
+    }
+
+    It 'honours a held lock created by a trusted account' {
+        $holder = Open-LockHolder -Name $lockName -Mode Squat
+        $owner = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+
+        # Same mutex as above, but its owner (this account, or Administrators when elevated) is trusted.
+        $lock = Enter-MaintenanceLock -Name $lockName -TrustedSid 'S-1-5-32-544', $owner
+
+        $lock.Status | Should -Be 'Busy'
+    }
+}

@@ -82,6 +82,8 @@
             A restart may ALSO be required: one exit code cannot carry both, so
             check "rebootRequired" in the JSON report.
       3010  Success, but a restart is required to finish.
+      170   Another run is already in progress (scheduled task or manual run);
+            nothing was changed. -WhatIf is not blocked.
 
     The JSON report lists every Windows update found (steps[].Details): title, KB,
     result (Installed, InstalledWithErrors, Failed, Aborted, DownloadFailed,
@@ -1371,6 +1373,174 @@ function ConvertTo-StepNameList {
     , $names.ToArray()
 }
 
+function Get-MutexOwnerSid {
+    <#
+        Owner SID of a mutex, or $null when it cannot be read. Windows PowerShell 5.1
+        exposes Mutex.GetAccessControl(); PowerShell 7 (.NET) has it as an extension
+        method in System.Threading.AccessControl.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Threading.Mutex] $Mutex
+    )
+
+    try {
+        $extensions = 'System.Threading.ThreadingAclExtensions' -as [type]
+        if ($extensions) { $acl = $extensions::GetAccessControl($Mutex) }
+        else { $acl = $Mutex.GetAccessControl() }
+        return $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    }
+    catch {
+        return $null
+    }
+}
+
+function Enter-MaintenanceLock {
+    <#
+        Single-instance lock shared by the scheduled task, manual runs and any other caller.
+
+        It is a named kernel mutex in the Global namespace, so it is seen across logon
+        sessions (the task may run in another session or as SYSTEM). Windows releases a
+        mutex when its owner process exits, so a run that was killed or interrupted by a
+        restart never leaves a stale lock behind: the next run reports it as abandoned.
+
+        Any user can create a Global mutex. Since this script runs elevated, a standard
+        user could create the mutex first and hold it to block maintenance forever. An
+        existing mutex is therefore honoured only when its owner is in -TrustedSid
+        (Administrators, SYSTEM and the account running this script). Otherwise the run
+        continues without the lock and says why ("Untrusted"). If the owner cannot be read,
+        the lock is honoured.
+
+        Returns Status = Acquired, Busy or Untrusted, Abandoned and the mutex to release
+        with Exit-MaintenanceLock.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [ValidateNotNullOrEmpty()]
+        [string] $Name = 'Global\WindowsHealthAndUpdate',
+
+        # BUILTIN\Administrators, SYSTEM and the current account. The scheduled task runs
+        # elevated as the user, whose objects may be owned by the user instead of
+        # Administrators depending on the "default owner" security policy.
+        [ValidateNotNullOrEmpty()]
+        [string[]] $TrustedSid = @('S-1-5-32-544', 'S-1-5-18', [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+    )
+
+    $trusted = @($TrustedSid | Select-Object -Unique)
+
+    # PowerShell 7 keeps the mutex ACL types in a separate assembly.
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        Add-Type -AssemblyName 'System.Threading.AccessControl' -ErrorAction SilentlyContinue
+    }
+
+    # Only trusted accounts may open the mutex this run creates.
+    $security = $null
+    try {
+        $security = New-Object -TypeName System.Security.AccessControl.MutexSecurity
+        foreach ($sid in $trusted) {
+            $identity = New-Object -TypeName System.Security.Principal.SecurityIdentifier -ArgumentList $sid
+            $rule = New-Object -TypeName System.Security.AccessControl.MutexAccessRule -ArgumentList $identity, ([System.Security.AccessControl.MutexRights]::FullControl), ([System.Security.AccessControl.AccessControlType]::Allow)
+            $security.AddAccessRule($rule)
+        }
+    }
+    catch {
+        # Without the ACL types the default DACL of an elevated token still limits access
+        # to Administrators and SYSTEM.
+        $security = $null
+    }
+
+    $createdNew = $false
+    try {
+        $mutexAcl = 'System.Threading.MutexAcl' -as [type]
+        if ($security -and $mutexAcl) { $mutex = $mutexAcl::Create($false, $Name, [ref]$createdNew, $security) }
+        elseif ($security) { $mutex = [System.Threading.Mutex]::new($false, $Name, [ref]$createdNew, $security) }
+        else { $mutex = [System.Threading.Mutex]::new($false, $Name, [ref]$createdNew) }
+    }
+    catch {
+        # 0x80070005: the mutex exists and its ACL does not let this account open it.
+        if ((Get-ExceptionHResult -Exception $_.Exception) -ne -2147024891) { throw }
+        return [pscustomobject]@{
+            Status    = 'Untrusted'
+            Abandoned = $false
+            Owner     = $null
+            Mutex     = $null
+            Message   = "The lock '$Name' exists but this account cannot open it, so it was not created by this script. Continuing without the single-instance lock."
+        }
+    }
+
+    $owner = $null
+    if (-not $createdNew) {
+        $owner = Get-MutexOwnerSid -Mutex $mutex
+        if ($owner -and $owner -notin $trusted) {
+            $mutex.Dispose()
+            return [pscustomobject]@{
+                Status    = 'Untrusted'
+                Abandoned = $false
+                Owner     = $owner
+                Mutex     = $null
+                Message   = "The lock '$Name' is owned by an untrusted account ($owner), not by an earlier run. Continuing without the single-instance lock."
+            }
+        }
+    }
+
+    $acquired = $false
+    $abandoned = $false
+    try {
+        $acquired = $mutex.WaitOne(0)
+    }
+    catch {
+        # The previous owner exited without releasing it; ownership passes to this run.
+        $innermost = $_.Exception
+        while ($innermost.InnerException) { $innermost = $innermost.InnerException }
+        if ($innermost -isnot [System.Threading.AbandonedMutexException]) { $mutex.Dispose(); throw }
+        $acquired = $true
+        $abandoned = $true
+    }
+
+    if (-not $acquired) {
+        $mutex.Dispose()
+        return [pscustomobject]@{
+            Status    = 'Busy'
+            Abandoned = $false
+            Owner     = $owner
+            Mutex     = $null
+            Message   = 'Another maintenance run is already in progress (scheduled task or manual run).'
+        }
+    }
+
+    [pscustomobject]@{
+        Status    = 'Acquired'
+        Abandoned = $abandoned
+        Owner     = $owner
+        Mutex     = $mutex
+        Message   = $(if ($abandoned) { 'The previous maintenance run ended without finishing (killed or interrupted by a restart); its steps may be incomplete.' } else { '' })
+    }
+}
+
+function Exit-MaintenanceLock {
+    <#
+        Releases the lock taken by Enter-MaintenanceLock. Safe to call more than once and
+        with a lock that was never acquired.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object] $Lock
+    )
+
+    if (-not $Lock -or -not $Lock.Mutex) { return }
+    try {
+        if ($Lock.Status -eq 'Acquired') { $Lock.Mutex.ReleaseMutex() }
+    }
+    finally {
+        $Lock.Mutex.Dispose()
+        $Lock.Mutex = $null
+    }
+}
+
 function Start-DelayedRestart {
     <#
         Schedules a restart and returns $true only if shutdown.exe accepted it, so the
@@ -1458,6 +1628,18 @@ if (-not (Test-IsAdministrator)) {
     exit 1
 }
 
+# Single instance, checked before anything is touched: a manual run must not overlap the
+# scheduled task (concurrent winget/MSI installs, Windows Update and DISM fail or interfere).
+$lock = Enter-MaintenanceLock
+if ($lock.Status -eq 'Busy' -and -not $WhatIfPreference) {
+    Write-MaintenanceLog "$($lock.Message) Nothing was changed; run it again when the other run finishes." -Level Error
+    exit 170   # ERROR_BUSY: "The requested resource is in use."
+}
+if ($WhatIfPreference) {
+    # A dry run changes nothing, so it must not block a real run that starts meanwhile.
+    Exit-MaintenanceLock -Lock $lock
+}
+
 $null = New-Item -Path $LogDirectory -ItemType Directory -Force -WhatIf:$false -Confirm:$false
 $startedAt = Get-Date
 $timestamp = $startedAt.ToString('yyyyMMdd_HHmmss')
@@ -1490,6 +1672,13 @@ try {
     Write-MaintenanceLog ('Support    : {0}' -f $lifecycle.Message) -Level $supportLevel
     Write-MaintenanceLog ('PowerShell : {0} ({1}-bit)' -f $PSVersionTable.PSVersion, $(if ([Environment]::Is64BitProcess) { 64 } else { 32 }))
     Write-MaintenanceLog ('Logs       : {0}' -f $LogDirectory)
+
+    if ($lock.Status -eq 'Busy') {
+        Write-MaintenanceLog "$($lock.Message) -WhatIf continues because it changes nothing." -Level Warning
+    }
+    elseif ($lock.Message) {
+        Write-MaintenanceLog $lock.Message -Level Warning
+    }
 
     $pendingBefore = @(Get-PendingRebootReason)
     if ($pendingBefore.Count -gt 0) {
@@ -1633,6 +1822,10 @@ try {
         rebootRequired  = $rebootRequired
         rebootReasons   = $rebootReasons
         rebootScheduled = $rebootScheduled
+        lock            = [ordered]@{
+            status                 = $lock.Status
+            previousRunInterrupted = [bool]$lock.Abandoned
+        }
         exitCode        = $exitCode
     }
     ConvertTo-MaintenanceReportJson -Report $report | Set-Content -LiteralPath $reportPath -Encoding UTF8 -WhatIf:$false -Confirm:$false
@@ -1644,6 +1837,7 @@ catch {
 }
 finally {
     if ($transcriptStarted) { $null = Stop-Transcript }
+    Exit-MaintenanceLock -Lock $lock
 }
 
 exit $exitCode
