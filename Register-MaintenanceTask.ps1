@@ -161,6 +161,23 @@ function Test-SafeMaintenanceArgument {
     $Arguments -notmatch '[;|&`$()<>"\r\n]'
 }
 
+function Format-MaintenanceArgument {
+    <#
+        The task starts the script with "powershell.exe -File", which passes every
+        space-separated token as a separate literal string. "-Skip Repair, Defender"
+        would then skip only Repair, so spaces around commas are removed to keep
+        each list in one token ("-Skip Repair,Defender").
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string] $Arguments = ''
+    )
+
+    ($Arguments -replace '\s*,\s*', ',').Trim()
+}
+
 # When dot-sourced (for example by the Pester tests) only the helpers are loaded.
 if ($MyInvocation.InvocationName -eq '.') { return }
 
@@ -184,6 +201,7 @@ if ($Unregister) {
 if (-not (Test-SafeMaintenanceArgument -Arguments $MaintenanceArguments)) {
     throw 'MaintenanceArguments contains disallowed shell metacharacters (;, |, &, `, $, (), <>, ", or newlines).'
 }
+$MaintenanceArguments = Format-MaintenanceArgument -Arguments $MaintenanceArguments
 
 if (-not $ScriptPath) {
     $ScriptPath = Join-Path -Path $PSScriptRoot -ChildPath 'Invoke-WindowsMaintenance.ps1'

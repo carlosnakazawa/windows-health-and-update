@@ -68,3 +68,16 @@ jobs:
           $report.os | Format-List
           $report.lifecycle | Format-List
           if (-not $report.os.IsServer) { throw 'Expected Windows Server to be detected on the runner.' }
+
+      # Same command line shape as the scheduled task: powershell.exe -File with a list.
+      - name: Smoke test (powershell.exe -File with a step list)
+        run: |
+          $logs = Join-Path $env:RUNNER_TEMP 'maintenance-logs-file'
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./Invoke-WindowsMaintenance.ps1 -WhatIf -Only WinGet,WindowsUpdate -LogDirectory $logs
+          if ($LASTEXITCODE -notin 0, 3010) { throw "Unexpected exit code $LASTEXITCODE" }
+          $report = Get-ChildItem $logs -Filter '*.json' | Select-Object -First 1 | Get-Content -Raw | ConvertFrom-Json
+          $only = @($report.parameters.only)
+          "only = $($only -join ', ')"
+          if ($only.Count -ne 2 -or $only -notcontains 'WinGet' -or $only -notcontains 'WindowsUpdate') {
+            throw 'The step list was not passed through powershell.exe -File correctly.'
+          }

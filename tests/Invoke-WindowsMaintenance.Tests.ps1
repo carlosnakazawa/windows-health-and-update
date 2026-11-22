@@ -4,10 +4,12 @@
 param()
 
 BeforeAll {
-    $scriptPath = Join-Path -Path $PSScriptRoot -ChildPath '..\Invoke-WindowsMaintenance.ps1'
+    # Not named $scriptPath: dot-sourcing Register-MaintenanceTask.ps1 would overwrite it
+    # with its own -ScriptPath parameter (PowerShell variable names are case-insensitive).
+    $mainScriptPath = Join-Path -Path $PSScriptRoot -ChildPath '..\Invoke-WindowsMaintenance.ps1'
     $schedulerPath = Join-Path -Path $PSScriptRoot -ChildPath '..\Register-MaintenanceTask.ps1'
     # Dot-sourcing loads the functions only; the entry points return early.
-    . $scriptPath
+    . $mainScriptPath
     . $schedulerPath
 
     function Get-TestVersionInfo {
@@ -321,7 +323,76 @@ Describe 'Invoke-UpgradeReadinessStep' {
     }
 }
 
+Describe 'Step name lists (-Skip / -Only)' {
+    BeforeAll {
+        $parameters = (Get-Command -Name $mainScriptPath).Parameters
+
+        function Test-StepParameterValue {
+            param([string] $ParameterName, [string] $Value)
+            $validator = $parameters[$ParameterName].Attributes |
+                Where-Object { $_ -is [System.Management.Automation.ValidateScriptAttribute] }
+            $null = $validator.ScriptBlock.InvokeWithContext($null, [psvariable]::new('_', $Value))
+            $true
+        }
+    }
+
+    It 'accepts the comma-separated form that powershell.exe -File passes for <ParameterName>' -ForEach @(
+        @{ ParameterName = 'Skip' }
+        @{ ParameterName = 'Only' }
+    ) {
+        Test-StepParameterValue -ParameterName $ParameterName -Value 'WinGet,WindowsUpdate' | Should -BeTrue
+    }
+
+    It 'rejects unknown step names for <ParameterName>' -ForEach @(
+        @{ ParameterName = 'Skip' }
+        @{ ParameterName = 'Only' }
+    ) {
+        { Test-StepParameterValue -ParameterName $ParameterName -Value 'WinGet,Bogus' } | Should -Throw '*Unknown step*Bogus*'
+    }
+
+    It 'flattens <Description>' -ForEach @(
+        @{ Description = 'an array'; Value = @('Repair', 'Defender'); Expected = @('Repair', 'Defender') }
+        @{ Description = 'a comma-separated string'; Value = @('Repair,Defender'); Expected = @('Repair', 'Defender') }
+        @{ Description = 'mixed input with spaces, duplicates and empty items'; Value = @('Repair, defender', 'Repair,,'); Expected = @('Repair', 'Defender') }
+    ) {
+        $result = ConvertTo-StepNameList -Value $Value
+        $result | Should -Be $Expected
+    }
+
+    It 'returns an empty array when nothing is given' {
+        $result = ConvertTo-StepNameList -Value @()
+        $result.Count | Should -Be 0
+        , $result | Should -BeOfType [string[]]
+    }
+}
+
+Describe 'Invoke-UpgradeReadinessStep TPM version parsing' {
+    It 'reads a bare "2" SpecVersion as TPM 2.0' {
+        Mock Get-CimInstance {
+            param($ClassName)
+            switch ($ClassName) {
+                'Win32_Tpm' { return [pscustomobject]@{ SpecVersion = '2' } }
+                'Win32_PhysicalMemory' { return [pscustomobject]@{ Capacity = 8GB } }
+                'Win32_Processor' { return [pscustomobject]@{ Name = 'Test CPU'; AddressWidth = 64; NumberOfCores = 4; MaxClockSpeed = 2400 } }
+            }
+        }
+        Mock Get-ItemProperty { return [pscustomobject]@{ UEFISecureBootEnabled = 1 } }
+        Mock Get-Partition { return $null }
+        Mock Out-Host {}
+
+        (Invoke-UpgradeReadinessStep).Status | Should -Be 'Success'
+    }
+}
+
 Describe 'Register-MaintenanceTask helpers' {
+    It 'joins list values so -File keeps them in one token: <Value>' -ForEach @(
+        @{ Value = '-Only WinGet, WindowsUpdate'; Expected = '-Only WinGet,WindowsUpdate' }
+        @{ Value = '-Skip Repair ,Defender , Cleanup -AutoReboot'; Expected = '-Skip Repair,Defender,Cleanup -AutoReboot' }
+        @{ Value = ''; Expected = '' }
+    ) {
+        Format-MaintenanceArgument -Arguments $Value | Should -Be $Expected
+    }
+
     It 'accepts safe MaintenanceArguments: <Value>' -ForEach @(
         @{ Value = '' }
         @{ Value = '-Skip Repair, Defender' }

@@ -20,7 +20,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Pending restart detection, `-AutoReboot`, and exit code `3010` when a restart is required.
 - `-Skip`, `-Only`, `-WhatIf` and `-Confirm`.
 - JSON report next to the transcript, plus log retention.
-- `Register-MaintenanceTask.ps1` to schedule the maintenance.
+- `Register-MaintenanceTask.ps1` to schedule the maintenance, with an ACL check on the script folder and validation of `-MaintenanceArguments`.
+- `SECURITY.md` with a private vulnerability reporting policy.
 - Pester tests, PSScriptAnalyzer rules and a GitHub Actions workflow running on Windows Server 2022 and 2025 with Windows PowerShell 5.1 and PowerShell 7.
 
 ### Changed
@@ -28,7 +29,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Logs moved from the Desktop to `%ProgramData%\WindowsHealthAndUpdate\Logs`, which also works when the Desktop is redirected to OneDrive or when the script runs as SYSTEM.
 - Temporary files are only deleted when older than `-TempFileAgeDays` (default 2), so running installers are not affected.
 - A failing step no longer stops the run: each step reports Success, Warning, Failed or Skipped.
-- winget is located even when it is not on `PATH`, and its exit codes are interpreted.
+- winget is located even when it is not on `PATH`, and its exit codes are interpreted. Only packages with a known installed version are upgraded (no `--include-unknown`), which avoids repeated reinstalls.
+- `-Skip` and `-Only` also accept a comma-separated string (`-Skip Repair,Defender`), which is how `powershell.exe -File` passes lists from Task Scheduler, `cmd.exe` or deployment tools.
+- Temp and log cleanup never follow symbolic links or junctions.
 - DISM and SFC are called through `Sysnative` when the script runs in 32-bit PowerShell.
 
 ### Removed

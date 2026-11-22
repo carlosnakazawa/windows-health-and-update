@@ -93,10 +93,41 @@
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [ValidateSet('RestorePoint', 'WinGet', 'Store', 'WindowsUpdate', 'Defender', 'Repair', 'Cleanup', 'DiskHealth', 'UpgradeReadiness')]
+    # -Skip and -Only accept a PowerShell array (-Skip Repair, Defender) or one comma-separated
+    # string (-Skip Repair,Defender). The second form is what powershell.exe -File receives from
+    # Task Scheduler, cmd.exe or deployment tools, where ValidateSet would reject the value.
+    [ArgumentCompleter({
+            param($commandName, $parameterName, $wordToComplete)
+            $null = $commandName, $parameterName
+            'RestorePoint', 'WinGet', 'Store', 'WindowsUpdate', 'Defender', 'Repair', 'Cleanup', 'DiskHealth', 'UpgradeReadiness' |
+                Where-Object { $_ -like "$wordToComplete*" }
+        })]
+    [ValidateScript({
+            $validSteps = 'RestorePoint', 'WinGet', 'Store', 'WindowsUpdate', 'Defender', 'Repair', 'Cleanup', 'DiskHealth', 'UpgradeReadiness'
+            foreach ($name in ($_ -split ',')) {
+                if ($name.Trim() -and $name.Trim() -notin $validSteps) {
+                    throw "Unknown step '$($name.Trim())'. Valid steps: $($validSteps -join ', ')."
+                }
+            }
+            $true
+        })]
     [string[]] $Skip = @(),
 
-    [ValidateSet('RestorePoint', 'WinGet', 'Store', 'WindowsUpdate', 'Defender', 'Repair', 'Cleanup', 'DiskHealth', 'UpgradeReadiness')]
+    [ArgumentCompleter({
+            param($commandName, $parameterName, $wordToComplete)
+            $null = $commandName, $parameterName
+            'RestorePoint', 'WinGet', 'Store', 'WindowsUpdate', 'Defender', 'Repair', 'Cleanup', 'DiskHealth', 'UpgradeReadiness' |
+                Where-Object { $_ -like "$wordToComplete*" }
+        })]
+    [ValidateScript({
+            $validSteps = 'RestorePoint', 'WinGet', 'Store', 'WindowsUpdate', 'Defender', 'Repair', 'Cleanup', 'DiskHealth', 'UpgradeReadiness'
+            foreach ($name in ($_ -split ',')) {
+                if ($name.Trim() -and $name.Trim() -notin $validSteps) {
+                    throw "Unknown step '$($name.Trim())'. Valid steps: $($validSteps -join ', ')."
+                }
+            }
+            $true
+        })]
     [string[]] $Only = @(),
 
     [ValidateNotNullOrEmpty()]
@@ -919,14 +950,16 @@ function Clear-StaleFile {
                 Where-Object { $_.LastWriteTime -lt $OlderThan } |
                 Sort-Object -Property { $_.FullName.Length } -Descending |
                 ForEach-Object {
+                    # Inside "catch", $_ becomes the error record, so keep the directory in a variable.
+                    $directory = $_.FullName
                     try {
-                        if (([System.IO.File]::GetAttributes($_.FullName) -band $reparseFlag) -ne 0) { return }
-                        if (-not (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
-                            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                        if (([System.IO.File]::GetAttributes($directory) -band $reparseFlag) -ne 0) { return }
+                        if (-not (Get-ChildItem -LiteralPath $directory -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+                            Remove-Item -LiteralPath $directory -Force -ErrorAction SilentlyContinue
                         }
                     }
                     catch {
-                        Write-MaintenanceLog "Could not remove empty directory $($_.FullName): $($_.Exception.Message)" -Level Detail
+                        Write-MaintenanceLog "Could not remove empty directory ${directory}: $($_.Exception.Message)" -Level Detail
                     }
                 }
         }
@@ -1072,6 +1105,8 @@ function Invoke-UpgradeReadinessStep {
     }
     $tpmVersion = $null
     if ($tpm -and $tpm.SpecVersion) { $tpmVersion = ($tpm.SpecVersion -split ',')[0].Trim() }
+    # [version] needs at least "major.minor", so a bare "2" is read as "2.0".
+    if ($tpmVersion -match '^\d+$') { $tpmVersion = "$tpmVersion.0" }
     $parsedTpmVersion = $null
     $tpmOk = $tpmVersion -and [version]::TryParse($tpmVersion, [ref]$parsedTpmVersion) -and ($parsedTpmVersion -ge [version]'2.0')
     $checks += [pscustomobject]@{ Requirement = 'TPM 2.0'; Found = $(if ($tpmVersion) { "TPM $tpmVersion" } else { 'not found' }); Pass = [bool]$tpmOk }
@@ -1153,6 +1188,30 @@ function Invoke-MaintenanceStep {
     $result
 }
 
+function ConvertTo-StepNameList {
+    <#
+        Flattens -Skip/-Only values: splits comma-separated strings, trims, drops empty
+        entries and duplicates, and returns the canonical step names.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [string[]] $Value
+    )
+
+    $canonical = 'RestorePoint', 'WinGet', 'Store', 'WindowsUpdate', 'Defender', 'Repair', 'Cleanup', 'DiskHealth', 'UpgradeReadiness'
+    $names = New-Object -TypeName System.Collections.Generic.List[string]
+    foreach ($item in @($Value)) {
+        foreach ($part in ("$item" -split ',')) {
+            $match = $canonical | Where-Object { $_ -eq $part.Trim() } | Select-Object -First 1
+            if ($match -and -not $names.Contains($match)) { $names.Add($match) }
+        }
+    }
+    , $names.ToArray()
+}
+
 function Clear-OldLog {
     [CmdletBinding()]
     param(
@@ -1181,6 +1240,9 @@ function Clear-OldLog {
 # ---- Entry point -------------------------------------------------------------
 # When dot-sourced (for example by the Pester tests) only the functions are loaded.
 if ($MyInvocation.InvocationName -eq '.') { return }
+
+$Skip = ConvertTo-StepNameList -Value $Skip
+$Only = ConvertTo-StepNameList -Value $Only
 
 if (-not (Test-IsAdministrator)) {
     Write-MaintenanceLog 'Run this script from an elevated PowerShell (right-click > Run as administrator).' -Level Error
