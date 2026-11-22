@@ -1,0 +1,15 @@
+# Maintenance logs and reports
+*.log
+maintenance_*.json
+
+# PowerShell / Pester test artifacts
+testResults.xml
+coverage.xml
+
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(shutdown *)",
+      "Bash(*Format-Volume*)",
+      "Bash(*Clear-Disk*)",
+      "Bash(*DISM*/ResetBase*)"
+    ]
+  }
+}

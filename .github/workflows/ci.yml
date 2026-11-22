@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Harness static checks
+        shell: pwsh
+        run: ./scripts/Invoke-HarnessCheck.ps1 -SkipAnalyzer -SkipPester
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+
+      - name: Analyze
+        shell: pwsh
+        run: |
+          $issues = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          $issues | Format-Table -AutoSize -Wrap
+          if ($issues) { throw "PSScriptAnalyzer reported $(@($issues).Count) issue(s)." }
+
+  test:
+    name: Pester (${{ matrix.os }}, ${{ matrix.shell }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Pester
+        run: Install-Module -Name Pester -MinimumVersion 5.5.0 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Unit tests
+        run: |
+          Import-Module -Name Pester -MinimumVersion 5.5.0
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $config
+
+      # Runs the real entry point on Windows Server 2022/2025 without changing anything:
+      # version detection, lifecycle lookup, step applicability and the JSON report.
+      - name: Smoke test (-WhatIf)
+        run: |
+          $logs = Join-Path $env:RUNNER_TEMP 'maintenance-logs'
+          ./Invoke-WindowsMaintenance.ps1 -WhatIf -LogDirectory $logs
+          if ($LASTEXITCODE -notin 0, 3010) { throw "Unexpected exit code $LASTEXITCODE" }
+          $report = Get-ChildItem $logs -Filter '*.json' | Select-Object -First 1 | Get-Content -Raw | ConvertFrom-Json
+          $report.os | Format-List
+          $report.lifecycle | Format-List
+          if (-not $report.os.IsServer) { throw 'Expected Windows Server to be detected on the runner.' }
+
+      # Same command line shape as the scheduled task: powershell.exe -File with a list.
+      - name: Smoke test (powershell.exe -File with a step list)
+        run: |
+          $logs = Join-Path $env:RUNNER_TEMP 'maintenance-logs-file'
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./Invoke-WindowsMaintenance.ps1 -WhatIf -Only WinGet,WindowsUpdate -LogDirectory $logs
+          if ($LASTEXITCODE -notin 0, 3010) { throw "Unexpected exit code $LASTEXITCODE" }
+          $report = Get-ChildItem $logs -Filter '*.json' | Select-Object -First 1 | Get-Content -Raw | ConvertFrom-Json
+          $only = @($report.parameters.only)
+          "only = $($only -join ', ')"
+          if ($only.Count -ne 2 -or $only -notcontains 'WinGet' -or $only -notcontains 'WindowsUpdate') {
+            throw 'The step list was not passed through powershell.exe -File correctly.'
+          }
