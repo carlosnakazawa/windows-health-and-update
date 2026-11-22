@@ -44,7 +44,8 @@ The script also:
 - isolates every step: a failure is reported and the next step still runs;
 - writes a **transcript** and a **JSON report** to `%ProgramData%\WindowsHealthAndUpdate\Logs`, with retention;
 - supports `-WhatIf` and `-Confirm`;
-- returns exit codes that automation tools understand: `0` success, `1` failure, `3010` restart required.
+- returns exit codes that automation tools understand: `0` success, `1` failure, `3010` restart required;
+- reports each Windows update individually (title, KB, result, error code, restart need) in the JSON report.
 
 ## Supported Windows versions
 
@@ -168,6 +169,37 @@ Each run creates two files in the log directory:
 
 - `maintenance_<timestamp>.log`: PowerShell transcript;
 - `maintenance_<timestamp>.json`: structured report with OS details, support status, the result of each step, restart status and exit code. You can collect it from several machines or feed it to monitoring.
+
+For Windows Update, the report lists **every update found**, so after an unattended run you can tell what was installed, what failed and whether a restart is still needed:
+
+```json
+"steps": [{
+  "Step": "WindowsUpdate",
+  "Status": "Warning",
+  "Message": "1 installed, 1 failed (KB5070002). Restart required.",
+  "Details": [
+    { "Title": "2026-11 Cumulative Update", "KB": "KB5070001", "Result": "Installed", "HResult": null, "RebootRequired": true },
+    { "Title": "Servicing Stack Update", "KB": "KB5070002", "Result": "Failed", "HResult": "0x80240022", "RebootRequired": false }
+  ]
+}],
+"rebootRequired": true,
+"rebootScheduled": false
+```
+
+- `Result`: `Installed`, `InstalledWithErrors`, `Failed`, `Aborted`, `DownloadFailed`, or `NotInstalled` with a `Reason` (`Optional`, `FeatureUpdate`, `NeedsUserInput`).
+- `HResult`: the Windows Update error code, to look up in [Windows Update error codes](https://learn.microsoft.com/windows/deployment/update/windows-update-error-reference).
+- `rebootScheduled`: `true` only when `-AutoReboot` actually scheduled the restart; `rebootRequired` alone means it is still pending.
+
+Read the latest report:
+
+```powershell
+$latest = Get-ChildItem "$env:ProgramData\WindowsHealthAndUpdate\Logs\maintenance_*.json" | Sort-Object LastWriteTime | Select-Object -Last 1
+$report = Get-Content -LiteralPath $latest.FullName -Raw | ConvertFrom-Json
+$report.steps | Where-Object Step -eq 'WindowsUpdate' | Select-Object -ExpandProperty Details | Format-Table Title, KB, Result, HResult, RebootRequired
+"Restart required: $($report.rebootRequired) (scheduled: $($report.rebootScheduled))"
+```
+
+> **Exit code `1` can also mean a restart is pending.** A single exit code cannot say "something failed" and "restart required" at the same time, so a failure wins. Check `rebootRequired` in the report.
 
 DISM and SFC keep their own detailed logs in `%windir%\Logs\DISM\dism.log` and `%windir%\Logs\CBS\CBS.log`.
 

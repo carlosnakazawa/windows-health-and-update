@@ -158,6 +158,37 @@ Jeder Lauf erzeugt zwei Dateien im Protokollordner:
 - `maintenance_<Zeitstempel>.log`: PowerShell-Transkript;
 - `maintenance_<Zeitstempel>.json`: strukturierter Bericht mit Systemdaten, Supportstatus, dem Ergebnis jedes Schritts, Neustartbedarf und Exitcode. Sie können ihn von mehreren Rechnern einsammeln oder an ein Monitoring-Werkzeug übergeben.
 
+Für Windows Update listet der Bericht **jedes gefundene Update** auf. So sehen Sie nach einem unbeaufsichtigten Lauf, was installiert wurde, was fehlgeschlagen ist und ob noch ein Neustart nötig ist:
+
+```json
+"steps": [{
+  "Step": "WindowsUpdate",
+  "Status": "Warning",
+  "Message": "1 installed, 1 failed (KB5070002). Restart required.",
+  "Details": [
+    { "Title": "2026-11 Cumulative Update", "KB": "KB5070001", "Result": "Installed", "HResult": null, "RebootRequired": true },
+    { "Title": "Servicing Stack Update", "KB": "KB5070002", "Result": "Failed", "HResult": "0x80240022", "RebootRequired": false }
+  ]
+}],
+"rebootRequired": true,
+"rebootScheduled": false
+```
+
+- `Result`: `Installed`, `InstalledWithErrors`, `Failed`, `Aborted`, `DownloadFailed` oder `NotInstalled` mit einem `Reason` (`Optional`, `FeatureUpdate`, `NeedsUserInput`).
+- `HResult`: der Windows-Update-Fehlercode, nachzuschlagen in den [Windows-Update-Fehlercodes](https://learn.microsoft.com/windows/deployment/update/windows-update-error-reference).
+- `rebootScheduled`: nur `true`, wenn `-AutoReboot` den Neustart tatsächlich geplant hat; `rebootRequired` allein bedeutet, dass er noch aussteht.
+
+Den neuesten Bericht lesen:
+
+```powershell
+$latest = Get-ChildItem "$env:ProgramData\WindowsHealthAndUpdate\Logs\maintenance_*.json" | Sort-Object LastWriteTime | Select-Object -Last 1
+$report = Get-Content -LiteralPath $latest.FullName -Raw | ConvertFrom-Json
+$report.steps | Where-Object Step -eq 'WindowsUpdate' | Select-Object -ExpandProperty Details | Format-Table Title, KB, Result, HResult, RebootRequired
+"Restart required: $($report.rebootRequired) (scheduled: $($report.rebootScheduled))"
+```
+
+> **Exitcode `1` kann auch bedeuten, dass ein Neustart aussteht.** Ein einzelner Code kann nicht gleichzeitig „etwas ist fehlgeschlagen" und „Neustart erforderlich" ausdrücken, daher hat der Fehler Vorrang. Prüfen Sie `rebootRequired` im Bericht.
+
 DISM und SFC führen eigene ausführliche Protokolle in `%windir%\Logs\DISM\dism.log` und `%windir%\Logs\CBS\CBS.log`.
 
 ## Was das Skript nicht tut

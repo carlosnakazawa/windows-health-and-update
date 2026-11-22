@@ -158,6 +158,37 @@ Get-Help .\Invoke-WindowsMaintenance.ps1 -Detailed
 - `maintenance_<날짜_시간>.log`: PowerShell 기록.
 - `maintenance_<날짜_시간>.json`: 시스템 정보, 지원 상태, 단계별 결과, 재부팅 필요 여부, 종료 코드를 담은 구조화된 보고서. 여러 PC에서 수집하거나 모니터링 도구로 보낼 수 있습니다.
 
+Windows 업데이트의 경우 보고서에 **발견된 모든 업데이트**가 기록됩니다. 그래서 무인 실행 후에도 무엇이 설치되었고, 무엇이 실패했으며, 아직 다시 시작해야 하는지 알 수 있습니다.
+
+```json
+"steps": [{
+  "Step": "WindowsUpdate",
+  "Status": "Warning",
+  "Message": "1 installed, 1 failed (KB5070002). Restart required.",
+  "Details": [
+    { "Title": "2026-11 Cumulative Update", "KB": "KB5070001", "Result": "Installed", "HResult": null, "RebootRequired": true },
+    { "Title": "Servicing Stack Update", "KB": "KB5070002", "Result": "Failed", "HResult": "0x80240022", "RebootRequired": false }
+  ]
+}],
+"rebootRequired": true,
+"rebootScheduled": false
+```
+
+- `Result`: `Installed`, `InstalledWithErrors`, `Failed`, `Aborted`, `DownloadFailed`, 또는 `Reason`(`Optional`, `FeatureUpdate`, `NeedsUserInput`)이 붙은 `NotInstalled`.
+- `HResult`: Windows 업데이트 오류 코드입니다. [Windows 업데이트 오류 코드 목록](https://learn.microsoft.com/windows/deployment/update/windows-update-error-reference)에서 찾아볼 수 있습니다.
+- `rebootScheduled`: `-AutoReboot`이 실제로 다시 시작을 예약한 경우에만 `true`입니다. `rebootRequired`만 `true`라면 다시 시작이 아직 대기 중이라는 뜻입니다.
+
+최신 보고서 읽기:
+
+```powershell
+$latest = Get-ChildItem "$env:ProgramData\WindowsHealthAndUpdate\Logs\maintenance_*.json" | Sort-Object LastWriteTime | Select-Object -Last 1
+$report = Get-Content -LiteralPath $latest.FullName -Raw | ConvertFrom-Json
+$report.steps | Where-Object Step -eq 'WindowsUpdate' | Select-Object -ExpandProperty Details | Format-Table Title, KB, Result, HResult, RebootRequired
+"Restart required: $($report.rebootRequired) (scheduled: $($report.rebootScheduled))"
+```
+
+> **종료 코드 `1`은 다시 시작이 대기 중이라는 뜻일 수도 있습니다.** 종료 코드 하나로 "실패"와 "다시 시작 필요"를 동시에 나타낼 수 없으므로 실패가 우선합니다. 보고서의 `rebootRequired`를 확인하세요.
+
 DISM과 SFC는 각각 `%windir%\Logs\DISM\dism.log`와 `%windir%\Logs\CBS\CBS.log`에 자세한 로그를 남깁니다.
 
 ## 이 스크립트가 하지 않는 일

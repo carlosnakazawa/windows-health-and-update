@@ -158,6 +158,37 @@ Get-Help .\Invoke-WindowsMaintenance.ps1 -Detailed
 - `maintenance_<дата_время>.log`: журнал сеанса PowerShell;
 - `maintenance_<дата_время>.json`: структурированный отчёт со сведениями о системе, статусом поддержки, результатом каждого шага, необходимостью перезагрузки и кодом выхода. Его можно собирать с нескольких компьютеров или передавать в систему мониторинга.
 
+Для Windows Update отчёт перечисляет **каждое найденное обновление**. Поэтому после запуска без присмотра видно, что установилось, что завершилось ошибкой и нужна ли ещё перезагрузка:
+
+```json
+"steps": [{
+  "Step": "WindowsUpdate",
+  "Status": "Warning",
+  "Message": "1 installed, 1 failed (KB5070002). Restart required.",
+  "Details": [
+    { "Title": "2026-11 Cumulative Update", "KB": "KB5070001", "Result": "Installed", "HResult": null, "RebootRequired": true },
+    { "Title": "Servicing Stack Update", "KB": "KB5070002", "Result": "Failed", "HResult": "0x80240022", "RebootRequired": false }
+  ]
+}],
+"rebootRequired": true,
+"rebootScheduled": false
+```
+
+- `Result`: `Installed`, `InstalledWithErrors`, `Failed`, `Aborted`, `DownloadFailed` или `NotInstalled` с полем `Reason` (`Optional`, `FeatureUpdate`, `NeedsUserInput`).
+- `HResult`: код ошибки Windows Update; его можно найти в [списке кодов ошибок Windows Update](https://learn.microsoft.com/windows/deployment/update/windows-update-error-reference).
+- `rebootScheduled`: `true` только если `-AutoReboot` действительно запланировал перезагрузку; одно лишь `rebootRequired` означает, что она ещё не выполнена.
+
+Прочитать последний отчёт:
+
+```powershell
+$latest = Get-ChildItem "$env:ProgramData\WindowsHealthAndUpdate\Logs\maintenance_*.json" | Sort-Object LastWriteTime | Select-Object -Last 1
+$report = Get-Content -LiteralPath $latest.FullName -Raw | ConvertFrom-Json
+$report.steps | Where-Object Step -eq 'WindowsUpdate' | Select-Object -ExpandProperty Details | Format-Table Title, KB, Result, HResult, RebootRequired
+"Restart required: $($report.rebootRequired) (scheduled: $($report.rebootScheduled))"
+```
+
+> **Код выхода `1` может также означать, что требуется перезагрузка.** Один код не может одновременно сообщить «что-то не удалось» и «нужна перезагрузка», поэтому приоритет у ошибки. Проверяйте `rebootRequired` в отчёте.
+
 DISM и SFC ведут собственные подробные журналы: `%windir%\Logs\DISM\dism.log` и `%windir%\Logs\CBS\CBS.log`.
 
 ## Чего скрипт не делает
