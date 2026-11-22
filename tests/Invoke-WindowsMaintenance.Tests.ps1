@@ -896,7 +896,9 @@ if ($Mode -eq 'Hold') { Exit-MaintenanceLock -Lock $lock }
         $lock = Enter-MaintenanceLock -Name $lockName
 
         $lock.Status | Should -Be 'Untrusted'
-        $lock.Message | Should -Match 'hides its owner'
+        # Windows PowerShell 5.1 opens the mutex with reduced rights and fails to read the
+        # owner; PowerShell 7 (MutexAcl) asks for full access and cannot open it at all.
+        $lock.Message | Should -Match 'hides its owner|cannot open it'
     }
 
     It 'honours a held lock created by a trusted account' {
