@@ -79,7 +79,14 @@
     Exit codes:
       0     Success (warnings may have been reported).
       1     At least one step failed, or the script is not running elevated.
+            A restart may ALSO be required: one exit code cannot carry both, so
+            check "rebootRequired" in the JSON report.
       3010  Success, but a restart is required to finish.
+
+    The JSON report lists every Windows update found (steps[].Details): title, KB,
+    result (Installed, InstalledWithErrors, Failed, Aborted, DownloadFailed,
+    NotInstalled), HRESULT, reason and whether it needs a restart. "rebootScheduled"
+    tells whether -AutoReboot actually scheduled the restart.
 
 .NOTES
     Author  : Carlos Alberto Nakazawa
@@ -190,7 +197,11 @@ function New-StepResult {
 
         [string] $Message = '',
 
-        [switch] $RebootRequired
+        [switch] $RebootRequired,
+
+        # Optional per-item records written to the JSON report (e.g. one per Windows update).
+        [AllowEmptyCollection()]
+        [object[]] $Details
     )
 
     $result = [pscustomobject]@{
@@ -198,6 +209,7 @@ function New-StepResult {
         Message        = $Message
         RebootRequired = [bool]$RebootRequired
         Duration       = [timespan]::Zero
+        Details        = $Details
     }
     $result.PSObject.TypeNames.Insert(0, 'WindowsMaintenance.StepResult')
     $result
@@ -219,6 +231,25 @@ function Format-ErrorRecord {
         $message = '{0} (0x{1:X8})' -f $message, $exception.HResult
     }
     $message
+}
+
+function Get-ExceptionHResult {
+    <#
+        Returns the HRESULT of the innermost exception. COM errors rarely arrive as
+        COMException: .NET maps well-known HRESULTs to other types (0x80070005 becomes
+        UnauthorizedAccessException) and PowerShell wraps method calls in
+        MethodInvocationException, so the outer exception's HResult is not the COM one.
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Exception] $Exception
+    )
+
+    $innermost = $Exception
+    while ($innermost.InnerException) { $innermost = $innermost.InnerException }
+    $innermost.HResult
 }
 
 #endregion
@@ -694,6 +725,123 @@ function Test-IsFeatureUpdate {
     $false
 }
 
+function ConvertTo-UpdateRecord {
+    <#
+        One entry of the JSON report: which update it is, what happened to it and why.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Update,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Installed', 'InstalledWithErrors', 'Failed', 'Aborted', 'DownloadFailed', 'NotInstalled')]
+        [string] $Result,
+
+        [ValidateSet('', 'Optional', 'FeatureUpdate', 'NeedsUserInput')]
+        [string] $Reason = '',
+
+        [int] $HResult = 0,
+
+        [switch] $RebootRequired
+    )
+
+    $kb = @($Update.KBArticleIDs | Where-Object { $_ } | ForEach-Object { "KB$_" }) -join ', '
+    $updateId = $null
+    if ($Update.Identity) { $updateId = "$($Update.Identity.UpdateID)" }
+
+    [pscustomobject]@{
+        Title          = "$($Update.Title)"
+        KB             = $(if ($kb) { $kb } else { $null })
+        UpdateId       = $updateId
+        Result         = $Result
+        Reason         = $(if ($Reason) { $Reason } else { $null })
+        HResult        = $(if ($HResult -ne 0) { '0x{0:X8}' -f $HResult } else { $null })
+        RebootRequired = [bool]$RebootRequired
+    }
+}
+
+function Get-WindowsUpdateSummary {
+    <#
+        Derives the step status and a one-line message from the update records. The
+        message names the failed updates, so the console summary and the JSON "Message"
+        are useful even without reading the per-update details.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Record = @(),
+
+        [switch] $RebootRequired
+    )
+
+    $Record = @($Record | Where-Object { $null -ne $_ })
+    $installed = @($Record | Where-Object { $_.Result -eq 'Installed' })
+    $withErrors = @($Record | Where-Object { $_.Result -eq 'InstalledWithErrors' })
+    $failed = @($Record | Where-Object { $_.Result -in 'Failed', 'Aborted', 'DownloadFailed' })
+    $notInstalled = @($Record | Where-Object { $_.Result -eq 'NotInstalled' })
+    $attempted = $installed.Count + $withErrors.Count + $failed.Count
+
+    $parts = @()
+    if ($attempted -gt 0) {
+        $parts += "$($installed.Count) installed"
+        if ($withErrors.Count -gt 0) { $parts += "$($withErrors.Count) installed with errors" }
+        if ($failed.Count -gt 0) {
+            $names = $failed | ForEach-Object { if ($_.KB) { $_.KB } else { $_.Title } }
+            $parts += '{0} failed ({1})' -f $failed.Count, ($names -join ', ')
+        }
+    }
+    if ($notInstalled.Count -gt 0) {
+        $parts += "$($notInstalled.Count) left for later (optional, feature or interactive)"
+    }
+
+    if ($parts.Count -eq 0) { $message = 'No pending updates.' }
+    else { $message = ($parts -join ', ') + '.' }
+    if ($RebootRequired) { $message += ' Restart required.' }
+
+    if ($attempted -gt 0 -and $installed.Count -eq 0 -and $withErrors.Count -eq 0) { $status = 'Failed' }
+    elseif ($failed.Count -gt 0 -or $withErrors.Count -gt 0) { $status = 'Warning' }
+    else { $status = 'Success' }
+
+    [pscustomobject]@{ Status = $status; Message = $message }
+}
+
+function Get-WindowsUpdateErrorResult {
+    <#
+        Download() or Install() threw for the whole batch: reports every pending update
+        as failed with the HRESULT, keeping the records collected so far.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('download', 'install')]
+        [string] $Phase,
+
+        [Parameter(Mandatory = $true)]
+        [System.Management.Automation.ErrorRecord] $ErrorRecord,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Pending,
+
+        [AllowEmptyCollection()]
+        [object[]] $Record = @()
+    )
+
+    $hResult = Get-ExceptionHResult -Exception $ErrorRecord.Exception
+    $details = @($Record) + @(foreach ($update in $Pending) { ConvertTo-UpdateRecord -Update $update -Result Failed -HResult $hResult })
+
+    if ($hResult -eq -2147024891) {
+        $message = "Windows Update $Phase denied (0x80070005). The Windows Update Agent API blocks remote sessions (WinRM/SSH); run locally or via a scheduled task."
+    }
+    else {
+        $message = 'Windows Update {0} failed (0x{1:X8}): {2}' -f $Phase, $hResult, (Format-ErrorRecord -ErrorRecord $ErrorRecord)
+    }
+    New-StepResult -Status Failed -Message $message -Details $details
+}
+
 function Invoke-WindowsUpdateStep {
     [CmdletBinding()]
     param(
@@ -710,18 +858,26 @@ function Invoke-WindowsUpdateStep {
     Write-MaintenanceLog "Searching Windows Update ($criteria)..."
     $search = $session.CreateUpdateSearcher().Search($criteria)
 
+    # One record per update found, so the JSON report shows what was installed, what
+    # failed (with its HRESULT), what needs a restart and what was left for later.
+    $records = [System.Collections.Generic.List[object]]::new()
     $toInstall = New-Object -ComObject 'Microsoft.Update.UpdateColl'
     foreach ($update in $search.Updates) {
+        $notInstalledReason = ''
         if ($update.BrowseOnly) {
+            $notInstalledReason = 'Optional'
             Write-MaintenanceLog "Optional, not installed: $($update.Title)" -Level Detail
-            continue
         }
-        if (-not $IncludeFeatureUpdates -and (Test-IsFeatureUpdate -Update $update)) {
+        elseif (-not $IncludeFeatureUpdates -and (Test-IsFeatureUpdate -Update $update)) {
+            $notInstalledReason = 'FeatureUpdate'
             Write-MaintenanceLog "Feature update, not installed (use -IncludeFeatureUpdates): $($update.Title)" -Level Warning
-            continue
         }
-        if ($update.InstallationBehavior.CanRequestUserInput) {
+        elseif ($update.InstallationBehavior.CanRequestUserInput) {
+            $notInstalledReason = 'NeedsUserInput'
             Write-MaintenanceLog "Needs user input, install it from Settings: $($update.Title)" -Level Warning
+        }
+        if ($notInstalledReason) {
+            $records.Add((ConvertTo-UpdateRecord -Update $update -Result NotInstalled -Reason $notInstalledReason))
             continue
         }
         if (-not $update.EulaAccepted) { $update.AcceptEula() }
@@ -730,30 +886,37 @@ function Invoke-WindowsUpdateStep {
     }
 
     if ($toInstall.Count -eq 0) {
-        return (New-StepResult -Status Success -Message 'No pending updates.')
+        $summary = Get-WindowsUpdateSummary -Record $records.ToArray()
+        return (New-StepResult -Status $summary.Status -Message $summary.Message -Details $records.ToArray())
     }
 
     Write-MaintenanceLog "Downloading $($toInstall.Count) update(s)..."
     $downloader = $session.CreateUpdateDownloader()
     $downloader.Updates = $toInstall
     try {
-        $null = $downloader.Download()
+        $downloadResult = $downloader.Download()
     }
-    catch [System.Runtime.InteropServices.COMException] {
-        if ($_.Exception.HResult -eq -2147024891) {
-            return (New-StepResult -Status Failed -Message 'Windows Update download denied (0x80070005). The Windows Update Agent API blocks remote sessions (WinRM/SSH); run locally or via a scheduled task.')
-        }
-        throw
+    catch {
+        # Not "catch [COMException]": E_ACCESSDENIED arrives as UnauthorizedAccessException.
+        return (Get-WindowsUpdateErrorResult -Phase download -ErrorRecord $_ -Pending $toInstall -Record $records.ToArray())
     }
 
     $downloaded = New-Object -ComObject 'Microsoft.Update.UpdateColl'
-    foreach ($update in $toInstall) {
-        if ($update.IsDownloaded) { $null = $downloaded.Add($update) }
-        else { Write-MaintenanceLog "Download failed: $($update.Title)" -Level Warning }
+    for ($i = 0; $i -lt $toInstall.Count; $i++) {
+        $update = $toInstall.Item($i)
+        if ($update.IsDownloaded) {
+            $null = $downloaded.Add($update)
+            continue
+        }
+        $hResult = 0
+        if ($downloadResult) { $hResult = [int]$downloadResult.GetUpdateResult($i).HResult }
+        $record = ConvertTo-UpdateRecord -Update $update -Result DownloadFailed -HResult $hResult
+        $records.Add($record)
+        Write-MaintenanceLog ('Download failed{0}: {1}' -f $(if ($record.HResult) { " ($($record.HResult))" }), $update.Title) -Level Warning
     }
-    $downloadFailed = $toInstall.Count - $downloaded.Count
     if ($downloaded.Count -eq 0) {
-        return (New-StepResult -Status Failed -Message 'Updates were found but none could be downloaded. Check the network connection and try again.')
+        $summary = Get-WindowsUpdateSummary -Record $records.ToArray()
+        return (New-StepResult -Status Failed -Message "$($summary.Message) Nothing could be downloaded; check the network connection." -Details $records.ToArray())
     }
 
     Write-MaintenanceLog "Installing $($downloaded.Count) update(s)..."
@@ -762,48 +925,38 @@ function Invoke-WindowsUpdateStep {
     try {
         $installResult = $installer.Install()
     }
-    catch [System.Runtime.InteropServices.COMException] {
-        if ($_.Exception.HResult -eq -2147024891) {
-            return (New-StepResult -Status Failed -Message 'Windows Update install denied (0x80070005). The Windows Update Agent API blocks remote sessions (WinRM/SSH); run locally or via a scheduled task.')
-        }
-        throw
+    catch {
+        return (Get-WindowsUpdateErrorResult -Phase install -ErrorRecord $_ -Pending $downloaded -Record $records.ToArray())
     }
 
     # OperationResultCode: 2 = Succeeded, 3 = SucceededWithErrors, 4 = Failed, 5 = Aborted
-    $succeeded = 0
-    $succeededWithErrors = 0
-    $failed = 0
-    for ($i = 0; $i -lt $downloaded.Count; $i++) {
-        $title = $downloaded.Item($i).Title
-        $code = $installResult.GetUpdateResult($i).ResultCode
-        if ($code -eq 2) {
-            $succeeded++
-            Write-MaintenanceLog "Installed: $title" -Level Success
-        }
-        elseif ($code -eq 3) {
-            $succeededWithErrors++
-            Write-MaintenanceLog "Installed with errors: $title" -Level Warning
-        }
-        else {
-            $failed++
-            Write-MaintenanceLog "Failed (result code $code): $title" -Level Error
-        }
-    }
-
-    $summaryParts = @("$succeeded installed")
-    if ($succeededWithErrors -gt 0) { $summaryParts += "$succeededWithErrors installed with errors" }
-    if ($downloadFailed -gt 0) { $summaryParts += "$downloadFailed download failed" }
-    $summaryParts += "$failed failed"
-    $summary = ($summaryParts -join ', ') + '.'
-
     $reboot = [bool]$installResult.RebootRequired
-    if ($failed -gt 0 -and $succeeded -eq 0 -and $succeededWithErrors -eq 0) {
-        return (New-StepResult -Status Failed -Message $summary -RebootRequired:$reboot)
+    for ($i = 0; $i -lt $downloaded.Count; $i++) {
+        $update = $downloaded.Item($i)
+        $updateResult = $installResult.GetUpdateResult($i)
+        $outcome = switch ([int]$updateResult.ResultCode) {
+            2 { 'Installed' }
+            3 { 'InstalledWithErrors' }
+            5 { 'Aborted' }
+            default { 'Failed' }
+        }
+        $needsRestart = [bool]$updateResult.RebootRequired
+        if ($needsRestart) { $reboot = $true }
+
+        $record = ConvertTo-UpdateRecord -Update $update -Result $outcome -HResult ([int]$updateResult.HResult) -RebootRequired:$needsRestart
+        $records.Add($record)
+
+        $line = '{0}: {1}' -f $outcome, $update.Title
+        if ($record.HResult) { $line += " ($($record.HResult))" }
+        if ($needsRestart) { $line += ' - restart required' }
+        $level = 'Error'
+        if ($outcome -eq 'Installed') { $level = 'Success' }
+        elseif ($outcome -eq 'InstalledWithErrors') { $level = 'Warning' }
+        Write-MaintenanceLog $line -Level $level
     }
-    if ($failed -gt 0 -or $downloadFailed -gt 0 -or $succeededWithErrors -gt 0) {
-        return (New-StepResult -Status Warning -Message $summary -RebootRequired:$reboot)
-    }
-    New-StepResult -Status Success -Message $summary -RebootRequired:$reboot
+
+    $summary = Get-WindowsUpdateSummary -Record $records.ToArray() -RebootRequired:$reboot
+    New-StepResult -Status $summary.Status -Message $summary.Message -RebootRequired:$reboot -Details $records.ToArray()
 }
 
 function Invoke-DefenderStep {
@@ -1212,6 +1365,46 @@ function ConvertTo-StepNameList {
     , $names.ToArray()
 }
 
+function Start-DelayedRestart {
+    <#
+        Schedules a restart and returns $true only if shutdown.exe accepted it, so the
+        report can tell "restart scheduled" apart from "restart still required".
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    [OutputType([bool])]
+    param(
+        [ValidateRange(0, 3600)]
+        [int] $DelaySeconds = 120
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($env:COMPUTERNAME, "Restart in $DelaySeconds seconds")) { return $false }
+
+    $shutdown = Join-Path -Path (Get-NativeSystemPath) -ChildPath 'shutdown.exe'
+    & $shutdown /r /t $DelaySeconds /c 'Windows Health & Update: restarting to finish updates.'
+    if ($LASTEXITCODE -ne 0) {
+        # 1190 (0x4A6): a shutdown is already scheduled.
+        Write-MaintenanceLog "shutdown.exe exited with $LASTEXITCODE; the restart was not scheduled." -Level Warning
+        return $false
+    }
+    $true
+}
+
+function ConvertTo-MaintenanceReportJson {
+    <#
+        Serializes the report. ConvertTo-Json silently turns anything deeper than -Depth
+        into a type name string, and per-update details sit five levels down
+        (report > steps > step > Details > update), so the depth lives here with a test.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Report
+    )
+
+    $Report | ConvertTo-Json -Depth 10
+}
+
 function Clear-OldLog {
     [CmdletBinding()]
     param(
@@ -1370,6 +1563,7 @@ try {
                 Status   = $result.Status
                 Duration = $result.Duration.ToString('hh\:mm\:ss')
                 Message  = $result.Message
+                Details  = $result.Details
             })
     }
 
@@ -1391,6 +1585,18 @@ try {
         $exitCode = 3010
     }
 
+    # Scheduled before the report is written, so the report records whether it happened.
+    $rebootScheduled = $false
+    if ($rebootRequired) {
+        if ($AutoReboot) { $rebootScheduled = Start-DelayedRestart -DelaySeconds 120 }
+        if ($rebootScheduled) {
+            Write-MaintenanceLog 'Restarting in 2 minutes. Cancel with: shutdown /a' -Level Warning
+        }
+        else {
+            Write-MaintenanceLog ('Restart required to finish: {0}.' -f ($rebootReasons -join ', ')) -Level Warning
+        }
+    }
+
     $report = [ordered]@{
         scriptVersion  = $ScriptVersion
         startedAt      = $startedAt.ToString('o')
@@ -1407,23 +1613,14 @@ try {
             logRetentionDays      = $LogRetentionDays
             whatIf                = [bool]$WhatIfPreference
         }
-        steps          = $results
-        rebootRequired = $rebootRequired
-        rebootReasons  = $rebootReasons
-        exitCode       = $exitCode
+        steps           = $results
+        rebootRequired  = $rebootRequired
+        rebootReasons   = $rebootReasons
+        rebootScheduled = $rebootScheduled
+        exitCode        = $exitCode
     }
-    $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $reportPath -Encoding UTF8 -WhatIf:$false -Confirm:$false
+    ConvertTo-MaintenanceReportJson -Report $report | Set-Content -LiteralPath $reportPath -Encoding UTF8 -WhatIf:$false -Confirm:$false
     Write-MaintenanceLog "Report: $reportPath" -Level Detail
-
-    if ($rebootRequired) {
-        if ($AutoReboot -and $PSCmdlet.ShouldProcess($env:COMPUTERNAME, 'Restart in 2 minutes')) {
-            Write-MaintenanceLog 'Restarting in 2 minutes. Cancel with: shutdown /a' -Level Warning
-            & (Join-Path -Path (Get-NativeSystemPath) -ChildPath 'shutdown.exe') /r /t 120 /c 'Windows Health & Update: restarting to finish updates.'
-        }
-        else {
-            Write-MaintenanceLog ('Restart required to finish: {0}.' -f ($rebootReasons -join ', ')) -Level Warning
-        }
-    }
 }
 catch {
     Write-MaintenanceLog "Unexpected error: $(Format-ErrorRecord -ErrorRecord $_)" -Level Error
