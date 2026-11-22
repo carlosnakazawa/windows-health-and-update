@@ -421,3 +421,338 @@ Describe 'Register-MaintenanceTask helpers' {
         Test-IsPathUserWritable -Path $sysBinary | Should -BeFalse
     }
 }
+
+Describe 'Get-ExceptionHResult' {
+    It 'finds E_ACCESSDENIED behind the PowerShell and .NET wrappers' {
+        # The real chain: MethodInvocationException -> UnauthorizedAccessException(0x80070005).
+        $thrower = [pscustomobject]@{}
+        $thrower | Add-Member -MemberType ScriptMethod -Name Fail -Value { [System.Runtime.InteropServices.Marshal]::ThrowExceptionForHR(-2147024891) }
+        $caught = $null
+        try { $thrower.Fail() } catch { $caught = $_ }
+
+        $caught.Exception | Should -Not -BeOfType [System.Runtime.InteropServices.COMException]
+        Get-ExceptionHResult -Exception $caught.Exception | Should -Be -2147024891
+    }
+}
+
+Describe 'Windows Update reporting' {
+    BeforeAll {
+        # Test doubles for the Windows Update Agent COM API. Each fake update carries the
+        # download and install results that the fake downloader and installer return.
+        function Get-FakeUpdate {
+            param(
+                [string] $Title,
+                [string] $Kb = '',
+                [int] $ResultCode = 2,
+                [int] $HResult = 0,
+                [switch] $RebootRequired,
+                [switch] $NotDownloaded,
+                [int] $DownloadHResult = 0,
+                [switch] $BrowseOnly,
+                [switch] $FeatureUpdate,
+                [switch] $NeedsUserInput
+            )
+
+            $categories = @()
+            if ($FeatureUpdate) { $categories = @([pscustomobject]@{ CategoryID = '3689bdc8-b205-4af4-8d4b-a63924c5e9d5'; Name = 'Upgrades' }) }
+
+            $update = [pscustomobject]@{
+                Title                = $Title
+                KBArticleIDs         = @($Kb | Where-Object { $_ })
+                Identity             = [pscustomobject]@{ UpdateID = [guid]::NewGuid().Guid }
+                BrowseOnly           = [bool]$BrowseOnly
+                EulaAccepted         = $false
+                IsDownloaded         = -not $NotDownloaded
+                InstallationBehavior = [pscustomobject]@{ CanRequestUserInput = [bool]$NeedsUserInput }
+                Categories           = $categories
+                FakeDownload         = [pscustomobject]@{ ResultCode = $(if ($NotDownloaded) { 4 } else { 2 }); HResult = $DownloadHResult }
+                FakeInstall          = [pscustomobject]@{ ResultCode = $ResultCode; HResult = $HResult; RebootRequired = [bool]$RebootRequired }
+            }
+            $update | Add-Member -MemberType ScriptMethod -Name AcceptEula -Value { $this.EulaAccepted = $true }
+            $update
+        }
+
+        function Get-FakeUpdateSession {
+            param(
+                [object[]] $Updates = @(),
+                [int] $DownloadThrows = 0,
+                [int] $InstallThrows = 0
+            )
+
+            $session = [pscustomobject]@{
+                ClientApplicationID = ''
+                Found               = $Updates
+                DownloadThrows      = $DownloadThrows
+                InstallThrows       = $InstallThrows
+            }
+            $session | Add-Member -MemberType ScriptMethod -Name CreateUpdateSearcher -Value {
+                $searcher = [pscustomobject]@{ Found = $this.Found }
+                $searcher | Add-Member -MemberType ScriptMethod -Name Search -Value {
+                    param($criteria)
+                    $null = $criteria
+                    [pscustomobject]@{ Updates = $this.Found }
+                }
+                $searcher
+            }
+            $session | Add-Member -MemberType ScriptMethod -Name CreateUpdateDownloader -Value {
+                $downloader = [pscustomobject]@{ Updates = $null; Throws = $this.DownloadThrows }
+                $downloader | Add-Member -MemberType ScriptMethod -Name Download -Value {
+                    if ($this.Throws) { [System.Runtime.InteropServices.Marshal]::ThrowExceptionForHR($this.Throws) }
+                    $result = [pscustomobject]@{ Updates = $this.Updates }
+                    $result | Add-Member -MemberType ScriptMethod -Name GetUpdateResult -Value { param($index) $this.Updates.Item($index).FakeDownload }
+                    $result
+                }
+                $downloader
+            }
+            $session | Add-Member -MemberType ScriptMethod -Name CreateUpdateInstaller -Value {
+                $installer = [pscustomobject]@{ Updates = $null; Throws = $this.InstallThrows }
+                $installer | Add-Member -MemberType ScriptMethod -Name Install -Value {
+                    if ($this.Throws) { [System.Runtime.InteropServices.Marshal]::ThrowExceptionForHR($this.Throws) }
+                    $needsRestart = @($this.Updates | Where-Object { $_.FakeInstall.RebootRequired }).Count -gt 0
+                    $result = [pscustomobject]@{ Updates = $this.Updates; RebootRequired = $needsRestart }
+                    $result | Add-Member -MemberType ScriptMethod -Name GetUpdateResult -Value { param($index) $this.Updates.Item($index).FakeInstall }
+                    $result
+                }
+                $installer
+            }
+            $session
+        }
+    }
+
+    BeforeEach {
+        Mock Write-MaintenanceLog {}
+        Mock New-Object -ParameterFilter { $ComObject -eq 'Microsoft.Update.UpdateColl' } -MockWith { , [System.Collections.ArrayList]::new() }
+    }
+
+    Context 'one update installs and needs a restart, another fails (scheduled overnight run)' {
+        BeforeEach {
+            $fakeSession = Get-FakeUpdateSession -Updates @(
+                (Get-FakeUpdate -Title '2026-11 Cumulative Update' -Kb '5070001' -RebootRequired)
+                (Get-FakeUpdate -Title 'Servicing Stack Update' -Kb '5070002' -ResultCode 4 -HResult -2145124318)
+            )
+            Mock New-Object -ParameterFilter { $ComObject -eq 'Microsoft.Update.Session' } -MockWith { $fakeSession }
+        }
+
+        It 'returns Warning, flags the restart and names the failed update in the message' {
+            $result = Invoke-WindowsUpdateStep
+
+            $result.Status | Should -Be 'Warning'
+            $result.RebootRequired | Should -BeTrue
+            $result.Message | Should -Be '1 installed, 1 failed (KB5070002). Restart required.'
+        }
+
+        It 'records each update with its result, HRESULT and restart need' {
+            $details = (Invoke-WindowsUpdateStep).Details
+
+            $details.Count | Should -Be 2
+            $installed = $details | Where-Object { $_.KB -eq 'KB5070001' }
+            $installed.Result | Should -Be 'Installed'
+            $installed.RebootRequired | Should -BeTrue
+            $installed.HResult | Should -BeNullOrEmpty
+
+            $failed = $details | Where-Object { $_.KB -eq 'KB5070002' }
+            $failed.Result | Should -Be 'Failed'
+            $failed.HResult | Should -Be '0x80240022'
+            $failed.Title | Should -Be 'Servicing Stack Update'
+        }
+
+        It 'keeps the details in the JSON report read the next morning' {
+            $step = Invoke-MaintenanceStep -Action { Invoke-WindowsUpdateStep }
+            $report = [ordered]@{
+                steps           = @([pscustomobject]@{ Step = 'WindowsUpdate'; Status = $step.Status; Message = $step.Message; Details = $step.Details })
+                rebootRequired  = $step.RebootRequired
+                rebootScheduled = $false
+            }
+
+            $json = ConvertTo-MaintenanceReportJson -Report $report
+            $json | Should -Not -Match 'System\.Management\.Automation'
+            $parsed = $json | ConvertFrom-Json
+
+            $parsed.rebootRequired | Should -BeTrue
+            $parsed.rebootScheduled | Should -BeFalse
+            $parsed.steps[0].Details[1].Result | Should -Be 'Failed'
+            $parsed.steps[0].Details[1].HResult | Should -Be '0x80240022'
+            $parsed.steps[0].Details[0].RebootRequired | Should -BeTrue
+        }
+    }
+
+    It 'returns Failed when every attempted update fails' {
+        $fakeSession = Get-FakeUpdateSession -Updates @(
+            (Get-FakeUpdate -Title 'Update A' -Kb '1' -ResultCode 4 -HResult -2145124318)
+            (Get-FakeUpdate -Title 'Update B' -Kb '2' -ResultCode 5)
+        )
+        Mock New-Object -ParameterFilter { $ComObject -eq 'Microsoft.Update.Session' } -MockWith { $fakeSession }
+
+        $result = Invoke-WindowsUpdateStep
+
+        $result.Status | Should -Be 'Failed'
+        $result.Message | Should -Be '0 installed, 2 failed (KB1, KB2).'
+        ($result.Details | Where-Object { $_.KB -eq 'KB2' }).Result | Should -Be 'Aborted'
+    }
+
+    It 'reports download failures per update and installs the rest' {
+        $fakeSession = Get-FakeUpdateSession -Updates @(
+            (Get-FakeUpdate -Title 'Downloads fine' -Kb '10')
+            (Get-FakeUpdate -Title 'Download breaks' -Kb '11' -NotDownloaded -DownloadHResult -2145107924)
+        )
+        Mock New-Object -ParameterFilter { $ComObject -eq 'Microsoft.Update.Session' } -MockWith { $fakeSession }
+
+        $result = Invoke-WindowsUpdateStep
+
+        $result.Status | Should -Be 'Warning'
+        $result.Message | Should -Be '1 installed, 1 failed (KB11).'
+        $broken = $result.Details | Where-Object { $_.KB -eq 'KB11' }
+        $broken.Result | Should -Be 'DownloadFailed'
+        $broken.HResult | Should -Be '0x8024402C'
+    }
+
+    It 'returns Failed with a network hint when nothing can be downloaded' {
+        $fakeSession = Get-FakeUpdateSession -Updates @((Get-FakeUpdate -Title 'Offline' -Kb '20' -NotDownloaded))
+        Mock New-Object -ParameterFilter { $ComObject -eq 'Microsoft.Update.Session' } -MockWith { $fakeSession }
+
+        $result = Invoke-WindowsUpdateStep
+
+        $result.Status | Should -Be 'Failed'
+        $result.Message | Should -Match 'check the network connection'
+    }
+
+    It 'explains E_ACCESSDENIED from a remote session instead of a generic error' {
+        $fakeSession = Get-FakeUpdateSession -Updates @((Get-FakeUpdate -Title 'Remote' -Kb '30')) -DownloadThrows -2147024891
+        Mock New-Object -ParameterFilter { $ComObject -eq 'Microsoft.Update.Session' } -MockWith { $fakeSession }
+
+        $result = Invoke-WindowsUpdateStep
+
+        $result.Status | Should -Be 'Failed'
+        $result.Message | Should -Match 'download denied \(0x80070005\).*remote sessions'
+        $result.Details[0].Result | Should -Be 'DownloadFailed'
+        $result.Details[0].HResult | Should -Be '0x80070005'
+    }
+
+    It 'reports the HRESULT when Install() fails for the whole batch' {
+        $fakeSession = Get-FakeUpdateSession -Updates @((Get-FakeUpdate -Title 'Batch' -Kb '40')) -InstallThrows -2145124329
+        Mock New-Object -ParameterFilter { $ComObject -eq 'Microsoft.Update.Session' } -MockWith { $fakeSession }
+
+        $result = Invoke-WindowsUpdateStep
+
+        $result.Status | Should -Be 'Failed'
+        $result.Message | Should -Match '^Windows Update install failed \(0x80240017\)'
+        $result.Details[0].Result | Should -Be 'Failed'
+        $result.Details[0].HResult | Should -Be '0x80240017'
+    }
+
+    It 'lists updates left for later with the reason' {
+        $fakeSession = Get-FakeUpdateSession -Updates @(
+            (Get-FakeUpdate -Title 'Optional preview' -Kb '50' -BrowseOnly)
+            (Get-FakeUpdate -Title 'Windows 11, version 26H2' -FeatureUpdate)
+            (Get-FakeUpdate -Title 'Interactive' -Kb '52' -NeedsUserInput)
+        )
+        Mock New-Object -ParameterFilter { $ComObject -eq 'Microsoft.Update.Session' } -MockWith { $fakeSession }
+
+        $result = Invoke-WindowsUpdateStep
+
+        $result.Status | Should -Be 'Success'
+        $result.Message | Should -Be '3 left for later (optional, feature or interactive).'
+        @($result.Details.Reason) | Should -Be @('Optional', 'FeatureUpdate', 'NeedsUserInput')
+        @($result.Details | Where-Object { $_.Result -ne 'NotInstalled' }).Count | Should -Be 0
+    }
+
+    It 'installs feature updates with -IncludeFeatureUpdates and accepts the EULA' {
+        $feature = Get-FakeUpdate -Title 'Windows 11, version 26H2' -FeatureUpdate
+        $fakeSession = Get-FakeUpdateSession -Updates @($feature)
+        Mock New-Object -ParameterFilter { $ComObject -eq 'Microsoft.Update.Session' } -MockWith { $fakeSession }
+
+        $result = Invoke-WindowsUpdateStep -IncludeFeatureUpdates
+
+        $result.Details[0].Result | Should -Be 'Installed'
+        $result.Details[0].KB | Should -BeNullOrEmpty
+        $feature.EulaAccepted | Should -BeTrue
+    }
+
+    It 'says so when there is nothing to install' {
+        $fakeSession = Get-FakeUpdateSession -Updates @()
+        Mock New-Object -ParameterFilter { $ComObject -eq 'Microsoft.Update.Session' } -MockWith { $fakeSession }
+
+        $result = Invoke-WindowsUpdateStep
+
+        $result.Status | Should -Be 'Success'
+        $result.Message | Should -Be 'No pending updates.'
+    }
+}
+
+Describe 'Get-WindowsUpdateSummary' {
+    It 'treats InstalledWithErrors as a warning' {
+        $summary = Get-WindowsUpdateSummary -Record @([pscustomobject]@{ Result = 'InstalledWithErrors'; KB = 'KB1'; Title = 'A' })
+        $summary.Status | Should -Be 'Warning'
+        $summary.Message | Should -Be '0 installed, 1 installed with errors.'
+    }
+
+    It 'names updates without a KB by title' {
+        $summary = Get-WindowsUpdateSummary -Record @(
+            [pscustomobject]@{ Result = 'Installed'; KB = 'KB1'; Title = 'A' }
+            [pscustomobject]@{ Result = 'Failed'; KB = $null; Title = 'Defender platform' }
+        )
+        $summary.Message | Should -Be '1 installed, 1 failed (Defender platform).'
+    }
+}
+
+Describe 'Start-DelayedRestart' {
+    It 'does not run shutdown.exe under -WhatIf' {
+        # Points at a folder without shutdown.exe, so a regression fails the test instead of restarting the PC.
+        Mock Get-NativeSystemPath { $TestDrive }
+        Mock Write-MaintenanceLog {}
+
+        Start-DelayedRestart -WhatIf | Should -BeFalse
+    }
+
+    Context 'output of the shutdown command' {
+        BeforeAll {
+            Mock Write-MaintenanceLog {}
+
+            # Stand-ins for shutdown.exe that print text, like a localized error message.
+            function Get-FakeShutdown {
+                param([string] $Name, [int] $ExitCode)
+                $path = Join-Path -Path $TestDrive -ChildPath "$Name.cmd"
+                Set-Content -LiteralPath $path -Encoding Ascii -Value @(
+                    '@echo off'
+                    'echo A system shutdown has already been scheduled.(1190)'
+                    "exit /b $ExitCode"
+                )
+                $path
+            }
+        }
+
+        It 'returns exactly $false, not an array, when shutdown fails and prints text' {
+            $result = Start-DelayedRestart -ShutdownPath (Get-FakeShutdown -Name 'busy' -ExitCode 1190) -Confirm:$false
+
+            , $result | Should -BeOfType [bool]
+            $result | Should -BeFalse
+        }
+
+        It 'returns exactly $true when shutdown succeeds and prints text' {
+            $result = Start-DelayedRestart -ShutdownPath (Get-FakeShutdown -Name 'ok' -ExitCode 0) -Confirm:$false
+
+            , $result | Should -BeOfType [bool]
+            $result | Should -BeTrue
+        }
+    }
+}
+
+Describe 'Format-ErrorRecord' {
+    It 'adds the HRESULT of a COM error wrapped by PowerShell' {
+        $thrower = [pscustomobject]@{}
+        # A COM error whose message does not already contain the code.
+        $thrower | Add-Member -MemberType ScriptMethod -Name Search -Value { throw (New-Object -TypeName System.Runtime.InteropServices.COMException -ArgumentList 'Search failed', -2145124329) }
+        $caught = $null
+        try { $thrower.Search() } catch { $caught = $_ }
+
+        $caught.Exception | Should -Not -BeOfType [System.Runtime.InteropServices.COMException]
+        Format-ErrorRecord -ErrorRecord $caught | Should -Match 'Search failed.*\(0x80240017\)$'
+    }
+
+    It 'leaves plain script errors unchanged' {
+        $caught = $null
+        try { throw 'plain failure' } catch { $caught = $_ }
+
+        Format-ErrorRecord -ErrorRecord $caught | Should -Be 'plain failure'
+    }
+}

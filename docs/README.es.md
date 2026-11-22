@@ -158,6 +158,37 @@ Cada ejecución crea dos archivos en la carpeta de registros:
 - `maintenance_<fecha_hora>.log`: transcripción de PowerShell;
 - `maintenance_<fecha_hora>.json`: informe estructurado con los datos del sistema, el estado de soporte, el resultado de cada paso, si hace falta reiniciar y el código de salida. Puedes recopilarlo de varios equipos o enviarlo a una herramienta de monitorización.
 
+En Windows Update, el informe enumera **cada actualización encontrada**. Así, después de una ejecución desatendida, se puede saber qué se instaló, qué falló y si todavía hace falta reiniciar:
+
+```json
+"steps": [{
+  "Step": "WindowsUpdate",
+  "Status": "Warning",
+  "Message": "1 installed, 1 failed (KB5070002). Restart required.",
+  "Details": [
+    { "Title": "2026-11 Cumulative Update", "KB": "KB5070001", "Result": "Installed", "HResult": null, "RebootRequired": true },
+    { "Title": "Servicing Stack Update", "KB": "KB5070002", "Result": "Failed", "HResult": "0x80240022", "RebootRequired": false }
+  ]
+}],
+"rebootRequired": true,
+"rebootScheduled": false
+```
+
+- `Result`: `Installed`, `InstalledWithErrors`, `Failed`, `Aborted`, `DownloadFailed`, o `NotInstalled` con un `Reason` (`Optional`, `FeatureUpdate`, `NeedsUserInput`).
+- `HResult`: el código de error de Windows Update, para consultarlo en los [códigos de error de Windows Update](https://learn.microsoft.com/windows/deployment/update/windows-update-error-reference).
+- `rebootScheduled`: `true` solo cuando `-AutoReboot` programó realmente el reinicio; `rebootRequired` por sí solo significa que sigue pendiente.
+
+Para leer el informe más reciente:
+
+```powershell
+$latest = Get-ChildItem "$env:ProgramData\WindowsHealthAndUpdate\Logs\maintenance_*.json" | Sort-Object LastWriteTime | Select-Object -Last 1
+$report = Get-Content -LiteralPath $latest.FullName -Raw | ConvertFrom-Json
+$report.steps | Where-Object Step -eq 'WindowsUpdate' | Select-Object -ExpandProperty Details | Format-Table Title, KB, Result, HResult, RebootRequired
+"Restart required: $($report.rebootRequired) (scheduled: $($report.rebootScheduled))"
+```
+
+> **El código de salida `1` también puede indicar un reinicio pendiente.** Un solo código no puede decir "algo falló" y "hace falta reiniciar" a la vez, así que prevalece el fallo. Consulta `rebootRequired` en el informe.
+
 DISM y SFC guardan sus propios registros detallados en `%windir%\Logs\DISM\dism.log` y `%windir%\Logs\CBS\CBS.log`.
 
 ## Lo que el script no hace

@@ -158,6 +158,37 @@ Get-Help .\Invoke-WindowsMaintenance.ps1 -Detailed
 - `maintenance_<时间戳>.log`：PowerShell 运行记录；
 - `maintenance_<时间戳>.json`：结构化报告，包含系统信息、支持状态、每个步骤的结果、是否需要重启以及退出代码。可以从多台电脑收集，或交给监控工具处理。
 
+对于 Windows 更新，报告会列出**找到的每一个更新**。因此在无人值守运行之后，也能知道哪些已安装、哪些失败了，以及是否仍需重启：
+
+```json
+"steps": [{
+  "Step": "WindowsUpdate",
+  "Status": "Warning",
+  "Message": "1 installed, 1 failed (KB5070002). Restart required.",
+  "Details": [
+    { "Title": "2026-11 Cumulative Update", "KB": "KB5070001", "Result": "Installed", "HResult": null, "RebootRequired": true },
+    { "Title": "Servicing Stack Update", "KB": "KB5070002", "Result": "Failed", "HResult": "0x80240022", "RebootRequired": false }
+  ]
+}],
+"rebootRequired": true,
+"rebootScheduled": false
+```
+
+- `Result`：`Installed`、`InstalledWithErrors`、`Failed`、`Aborted`、`DownloadFailed`，或带有 `Reason`（`Optional`、`FeatureUpdate`、`NeedsUserInput`）的 `NotInstalled`。
+- `HResult`：Windows 更新的错误代码，可在 [Windows 更新错误代码列表](https://learn.microsoft.com/windows/deployment/update/windows-update-error-reference)中查询。
+- `rebootScheduled`：只有当 `-AutoReboot` 确实安排了重启时才为 `true`；仅 `rebootRequired` 为 `true` 表示重启仍待完成。
+
+读取最新的报告：
+
+```powershell
+$latest = Get-ChildItem "$env:ProgramData\WindowsHealthAndUpdate\Logs\maintenance_*.json" | Sort-Object LastWriteTime | Select-Object -Last 1
+$report = Get-Content -LiteralPath $latest.FullName -Raw | ConvertFrom-Json
+$report.steps | Where-Object Step -eq 'WindowsUpdate' | Select-Object -ExpandProperty Details | Format-Table Title, KB, Result, HResult, RebootRequired
+"Restart required: $($report.rebootRequired) (scheduled: $($report.rebootScheduled))"
+```
+
+> **退出代码 `1` 也可能表示有待完成的重启。** 一个退出代码无法同时表达"有步骤失败"和"需要重启"，因此以失败为准。请查看报告中的 `rebootRequired`。
+
 DISM 和 SFC 会分别在 `%windir%\Logs\DISM\dism.log` 和 `%windir%\Logs\CBS\CBS.log` 中保留各自的详细日志。
 
 ## 脚本不会做的事

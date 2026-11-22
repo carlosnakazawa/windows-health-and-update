@@ -158,6 +158,37 @@ Chaque exécution crée deux fichiers dans le dossier des journaux :
 - `maintenance_<horodatage>.log` : transcription PowerShell ;
 - `maintenance_<horodatage>.json` : rapport structuré avec les informations système, l'état du support, le résultat de chaque étape, le besoin de redémarrage et le code de sortie. Vous pouvez le collecter sur plusieurs machines ou l'envoyer à un outil de supervision.
 
+Pour Windows Update, le rapport liste **chaque mise à jour trouvée**. Après une exécution sans surveillance, vous savez ainsi ce qui a été installé, ce qui a échoué et si un redémarrage est encore nécessaire :
+
+```json
+"steps": [{
+  "Step": "WindowsUpdate",
+  "Status": "Warning",
+  "Message": "1 installed, 1 failed (KB5070002). Restart required.",
+  "Details": [
+    { "Title": "2026-11 Cumulative Update", "KB": "KB5070001", "Result": "Installed", "HResult": null, "RebootRequired": true },
+    { "Title": "Servicing Stack Update", "KB": "KB5070002", "Result": "Failed", "HResult": "0x80240022", "RebootRequired": false }
+  ]
+}],
+"rebootRequired": true,
+"rebootScheduled": false
+```
+
+- `Result` : `Installed`, `InstalledWithErrors`, `Failed`, `Aborted`, `DownloadFailed`, ou `NotInstalled` avec un `Reason` (`Optional`, `FeatureUpdate`, `NeedsUserInput`).
+- `HResult` : le code d'erreur Windows Update, à rechercher dans les [codes d'erreur Windows Update](https://learn.microsoft.com/windows/deployment/update/windows-update-error-reference).
+- `rebootScheduled` : `true` uniquement si `-AutoReboot` a réellement planifié le redémarrage ; `rebootRequired` seul signifie qu'il est toujours en attente.
+
+Pour lire le rapport le plus récent :
+
+```powershell
+$latest = Get-ChildItem "$env:ProgramData\WindowsHealthAndUpdate\Logs\maintenance_*.json" | Sort-Object LastWriteTime | Select-Object -Last 1
+$report = Get-Content -LiteralPath $latest.FullName -Raw | ConvertFrom-Json
+$report.steps | Where-Object Step -eq 'WindowsUpdate' | Select-Object -ExpandProperty Details | Format-Table Title, KB, Result, HResult, RebootRequired
+"Restart required: $($report.rebootRequired) (scheduled: $($report.rebootScheduled))"
+```
+
+> **Le code de sortie `1` peut aussi signifier qu'un redémarrage est en attente.** Un seul code ne peut pas indiquer à la fois « un échec » et « redémarrage nécessaire » : l'échec l'emporte. Vérifiez `rebootRequired` dans le rapport.
+
 DISM et SFC conservent leurs propres journaux détaillés dans `%windir%\Logs\DISM\dism.log` et `%windir%\Logs\CBS\CBS.log`.
 
 ## Ce que le script ne fait pas

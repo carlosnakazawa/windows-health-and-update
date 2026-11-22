@@ -3,6 +3,25 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- The JSON report lists every Windows update found (`steps[].Details`): title, KB, update ID, result (`Installed`, `InstalledWithErrors`, `Failed`, `Aborted`, `DownloadFailed`, `NotInstalled`), reason, HRESULT and whether it needs a restart. After an unattended run you can tell what was installed, what failed and why. Thanks to community feedback on the overnight-run scenario.
+- `rebootScheduled` in the JSON report: `true` only when `-AutoReboot` actually scheduled the restart.
+- The Windows Update step message names the failed updates and says when a restart is required, for example `1 installed, 1 failed (KB5070002). Restart required.`
+
+### Changed
+
+- The report is written after the restart is scheduled, so it reflects whether that happened.
+- Documented that exit code `1` can also mean a restart is pending; the JSON report is the complete source.
+
+### Fixed
+
+- Remote sessions (WinRM/SSH) now get the explanation about `0x80070005`. The previous `catch [COMException]` never matched, because .NET turns `E_ACCESSDENIED` into `UnauthorizedAccessException`.
+- A batch-wide download or install error no longer drops the list of updates: each one is reported with the HRESULT.
+- Error messages include the HRESULT of COM errors that PowerShell wraps in `MethodInvocationException`, for example a failing Windows Update search.
+
 ## [2.0.0] - 2026-11-21
 
 ### Added
