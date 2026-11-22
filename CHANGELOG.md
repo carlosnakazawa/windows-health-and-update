@@ -20,6 +20,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 - Remote sessions (WinRM/SSH) now get the explanation about `0x80070005`. The previous `catch [COMException]` never matched, because .NET turns `E_ACCESSDENIED` into `UnauthorizedAccessException`.
 - A batch-wide download or install error no longer drops the list of updates: each one is reported with the HRESULT.
+- Error messages include the HRESULT of COM errors that PowerShell wraps in `MethodInvocationException`, for example a failing Windows Update search.
 
 ## [2.0.0] - 2026-11-21
 

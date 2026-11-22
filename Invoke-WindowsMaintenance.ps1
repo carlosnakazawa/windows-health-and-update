@@ -226,9 +226,12 @@ function Format-ErrorRecord {
     $exception = $ErrorRecord.Exception
     $message = ($exception.Message -replace '\s+', ' ').Trim()
 
-    # COM errors (Windows Update Agent) are only useful with their HRESULT.
-    if ($exception -is [System.Runtime.InteropServices.COMException] -and $message -notmatch '0x[0-9A-Fa-f]{8}') {
-        $message = '{0} (0x{1:X8})' -f $message, $exception.HResult
+    # COM errors (Windows Update Agent) are only useful with their HRESULT. PowerShell
+    # wraps COM method calls in MethodInvocationException, so look at the innermost one.
+    $innermost = $exception
+    while ($innermost.InnerException) { $innermost = $innermost.InnerException }
+    if ($innermost -is [System.Runtime.InteropServices.COMException] -and $message -notmatch '0x[0-9A-Fa-f]{8}') {
+        $message = '{0} (0x{1:X8})' -f $message, $innermost.HResult
     }
     $message
 }
@@ -831,7 +834,10 @@ function Get-WindowsUpdateErrorResult {
     )
 
     $hResult = Get-ExceptionHResult -Exception $ErrorRecord.Exception
-    $details = @($Record) + @(foreach ($update in $Pending) { ConvertTo-UpdateRecord -Update $update -Result Failed -HResult $hResult })
+    # Same Result value as a per-update download failure, so readers filter on one value.
+    $result = 'Failed'
+    if ($Phase -eq 'download') { $result = 'DownloadFailed' }
+    $details = @($Record) + @(foreach ($update in $Pending) { ConvertTo-UpdateRecord -Update $update -Result $result -HResult $hResult })
 
     if ($hResult -eq -2147024891) {
         $message = "Windows Update $Phase denied (0x80070005). The Windows Update Agent API blocks remote sessions (WinRM/SSH); run locally or via a scheduled task."
@@ -1374,16 +1380,26 @@ function Start-DelayedRestart {
     [OutputType([bool])]
     param(
         [ValidateRange(0, 3600)]
-        [int] $DelaySeconds = 120
+        [int] $DelaySeconds = 120,
+
+        # Defaults to the native shutdown.exe; tests point it at a stand-in.
+        [string] $ShutdownPath = ''
     )
 
     if (-not $PSCmdlet.ShouldProcess($env:COMPUTERNAME, "Restart in $DelaySeconds seconds")) { return $false }
 
-    $shutdown = Join-Path -Path (Get-NativeSystemPath) -ChildPath 'shutdown.exe'
-    & $shutdown /r /t $DelaySeconds /c 'Windows Health & Update: restarting to finish updates.'
-    if ($LASTEXITCODE -ne 0) {
+    $shutdown = $ShutdownPath
+    if (-not $shutdown) { $shutdown = Join-Path -Path (Get-NativeSystemPath) -ChildPath 'shutdown.exe' }
+    # Capture everything shutdown.exe prints: anything left on the output stream would
+    # be returned with the bool, and a non-empty array is truthy in "if".
+    $ErrorActionPreference = 'Continue'
+    $output = @(& $shutdown /r /t $DelaySeconds /c 'Windows Health & Update: restarting to finish updates.' 2>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
         # 1190 (0x4A6): a shutdown is already scheduled.
-        Write-MaintenanceLog "shutdown.exe exited with $LASTEXITCODE; the restart was not scheduled." -Level Warning
+        $detail = ''
+        if ($output.Count -gt 0) { $detail = ' ' + ($output -join ' ') }
+        Write-MaintenanceLog "shutdown.exe exited with $exitCode; the restart was not scheduled.$detail" -Level Warning
         return $false
     }
     $true

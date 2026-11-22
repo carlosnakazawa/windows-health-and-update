@@ -624,7 +624,7 @@ Describe 'Windows Update reporting' {
 
         $result.Status | Should -Be 'Failed'
         $result.Message | Should -Match 'download denied \(0x80070005\).*remote sessions'
-        $result.Details[0].Result | Should -Be 'Failed'
+        $result.Details[0].Result | Should -Be 'DownloadFailed'
         $result.Details[0].HResult | Should -Be '0x80070005'
     }
 
@@ -636,6 +636,7 @@ Describe 'Windows Update reporting' {
 
         $result.Status | Should -Be 'Failed'
         $result.Message | Should -Match '^Windows Update install failed \(0x80240017\)'
+        $result.Details[0].Result | Should -Be 'Failed'
         $result.Details[0].HResult | Should -Be '0x80240017'
     }
 
@@ -701,5 +702,57 @@ Describe 'Start-DelayedRestart' {
         Mock Write-MaintenanceLog {}
 
         Start-DelayedRestart -WhatIf | Should -BeFalse
+    }
+
+    Context 'output of the shutdown command' {
+        BeforeAll {
+            Mock Write-MaintenanceLog {}
+
+            # Stand-ins for shutdown.exe that print text, like a localized error message.
+            function Get-FakeShutdown {
+                param([string] $Name, [int] $ExitCode)
+                $path = Join-Path -Path $TestDrive -ChildPath "$Name.cmd"
+                Set-Content -LiteralPath $path -Encoding Ascii -Value @(
+                    '@echo off'
+                    'echo A system shutdown has already been scheduled.(1190)'
+                    "exit /b $ExitCode"
+                )
+                $path
+            }
+        }
+
+        It 'returns exactly $false, not an array, when shutdown fails and prints text' {
+            $result = Start-DelayedRestart -ShutdownPath (Get-FakeShutdown -Name 'busy' -ExitCode 1190) -Confirm:$false
+
+            , $result | Should -BeOfType [bool]
+            $result | Should -BeFalse
+        }
+
+        It 'returns exactly $true when shutdown succeeds and prints text' {
+            $result = Start-DelayedRestart -ShutdownPath (Get-FakeShutdown -Name 'ok' -ExitCode 0) -Confirm:$false
+
+            , $result | Should -BeOfType [bool]
+            $result | Should -BeTrue
+        }
+    }
+}
+
+Describe 'Format-ErrorRecord' {
+    It 'adds the HRESULT of a COM error wrapped by PowerShell' {
+        $thrower = [pscustomobject]@{}
+        # A COM error whose message does not already contain the code.
+        $thrower | Add-Member -MemberType ScriptMethod -Name Search -Value { throw (New-Object -TypeName System.Runtime.InteropServices.COMException -ArgumentList 'Search failed', -2145124329) }
+        $caught = $null
+        try { $thrower.Search() } catch { $caught = $_ }
+
+        $caught.Exception | Should -Not -BeOfType [System.Runtime.InteropServices.COMException]
+        Format-ErrorRecord -ErrorRecord $caught | Should -Match 'Search failed.*\(0x80240017\)$'
+    }
+
+    It 'leaves plain script errors unchanged' {
+        $caught = $null
+        try { throw 'plain failure' } catch { $caught = $_ }
+
+        Format-ErrorRecord -ErrorRecord $caught | Should -Be 'plain failure'
     }
 }
