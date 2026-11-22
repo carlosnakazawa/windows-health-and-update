@@ -106,6 +106,8 @@ jobs:
             "second run exit code: $code"
             if ($code -ne 170) { throw "Expected exit code 170 (already running), got $code." }
             if (Test-Path -LiteralPath $logs) { throw 'The blocked run created its log directory; it must stop before touching anything.' }
+            # 170 was the expected result; GitHub Actions ends the step with $LASTEXITCODE.
+            $global:LASTEXITCODE = 0
           }
           finally {
             Set-Content -LiteralPath $release -Value 'release'
