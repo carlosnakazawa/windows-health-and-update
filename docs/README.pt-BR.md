@@ -33,7 +33,8 @@ Além disso, o script:
 - isola cada etapa: uma falha é registrada e a próxima etapa continua;
 - grava uma **transcrição** e um **relatório JSON** em `%ProgramData%\WindowsHealthAndUpdate\Logs`, com retenção;
 - suporta `-WhatIf` e `-Confirm`;
-- retorna códigos de saída que ferramentas de automação entendem: `0` sucesso, `1` falha, `3010` reinicialização necessária.
+- roda **uma instância por vez**: se uma execução manual começar enquanto a tarefa agendada está rodando (ou o contrário), a segunda avisa e sai antes de mexer em qualquer coisa;
+- retorna códigos de saída que ferramentas de automação entendem: `0` sucesso, `1` falha, `3010` reinicialização necessária, `170` outra execução já em andamento.
 
 ## Versões do Windows suportadas
 

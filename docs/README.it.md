@@ -33,7 +33,8 @@ Inoltre lo script:
 - isola ogni passaggio: un errore viene registrato e il passaggio successivo viene eseguito comunque;
 - salva una **trascrizione** e un **report JSON** in `%ProgramData%\WindowsHealthAndUpdate\Logs`, con conservazione limitata nel tempo;
 - supporta `-WhatIf` e `-Confirm`;
-- restituisce codici di uscita comprensibili dagli strumenti di automazione: `0` successo, `1` errore, `3010` riavvio necessario.
+- esegue **una sola istanza alla volta**: se un'esecuzione manuale parte mentre l'attività pianificata è in corso (o viceversa), la seconda lo segnala ed esce prima di toccare qualsiasi cosa;
+- restituisce codici di uscita comprensibili dagli strumenti di automazione: `0` successo, `1` errore, `3010` riavvio necessario, `170` un'altra esecuzione è già in corso.
 
 ## Versioni di Windows supportate
 

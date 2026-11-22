@@ -33,7 +33,8 @@ Le script également :
 - isole chaque étape : un échec est consigné et l'étape suivante s'exécute quand même ;
 - enregistre une **transcription** et un **rapport JSON** dans `%ProgramData%\WindowsHealthAndUpdate\Logs`, avec rétention ;
 - prend en charge `-WhatIf` et `-Confirm` ;
-- renvoie des codes de sortie compris par les outils d'automatisation : `0` succès, `1` échec, `3010` redémarrage nécessaire.
+- s'exécute en **une seule instance à la fois** : si une exécution manuelle démarre pendant que la tâche planifiée tourne (ou l'inverse), la seconde le signale et s'arrête avant de toucher à quoi que ce soit ;
+- renvoie des codes de sortie compris par les outils d'automatisation : `0` succès, `1` échec, `3010` redémarrage nécessaire, `170` une autre exécution est déjà en cours.
 
 ## Versions de Windows prises en charge
 

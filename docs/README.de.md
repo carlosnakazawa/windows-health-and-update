@@ -33,7 +33,8 @@ Außerdem:
 - ist jeder Schritt isoliert: Ein Fehler wird protokolliert, und der nächste Schritt läuft trotzdem;
 - werden ein **Transkript** und ein **JSON-Bericht** in `%ProgramData%\WindowsHealthAndUpdate\Logs` gespeichert, mit Aufbewahrungsfrist;
 - werden `-WhatIf` und `-Confirm` unterstützt;
-- liefert das Skript Exitcodes, die Automatisierungswerkzeuge verstehen: `0` Erfolg, `1` Fehler, `3010` Neustart erforderlich.
+- läuft das Skript **immer nur einmal gleichzeitig**: Startet ein manueller Lauf, während die geplante Aufgabe läuft (oder umgekehrt), meldet der zweite das und beendet sich, bevor er etwas verändert;
+- liefert das Skript Exitcodes, die Automatisierungswerkzeuge verstehen: `0` Erfolg, `1` Fehler, `3010` Neustart erforderlich, `170` ein anderer Lauf ist bereits aktiv.
 
 ## Unterstützte Windows-Versionen
 
