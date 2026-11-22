@@ -770,6 +770,22 @@ switch ($Mode) {
     'Hold' { $lock = Enter-MaintenanceLock -Name $Name; $status = $lock.Status }
     'Abandon' { $lock = Enter-MaintenanceLock -Name $Name; $status = $lock.Status }
     'Squat' { $squat = [System.Threading.Mutex]::new($true, $Name); $status = 'Squatting' }
+    'SquatHidden' {
+        # Allows SYNCHRONIZE so the mutex can be opened, but nobody may read its owner:
+        # the OWNER RIGHTS (S-1-3-4) entry removes the owner's implicit READ_CONTROL.
+        if ($PSVersionTable.PSEdition -eq 'Core') { Add-Type -AssemblyName 'System.Threading.AccessControl' }
+        $rights = [System.Security.AccessControl.MutexRights]'Synchronize, Modify'
+        $security = New-Object -TypeName System.Security.AccessControl.MutexSecurity
+        foreach ($sid in @([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-3-4', 'S-1-5-32-544')) {
+            $identity = New-Object -TypeName System.Security.Principal.SecurityIdentifier -ArgumentList $sid
+            $security.AddAccessRule((New-Object -TypeName System.Security.AccessControl.MutexAccessRule -ArgumentList $identity, $rights, 'Allow'))
+        }
+        $created = $false
+        $mutexAcl = 'System.Threading.MutexAcl' -as [type]
+        if ($mutexAcl) { $squat = $mutexAcl::Create($true, $Name, [ref]$created, $security) }
+        else { $squat = [System.Threading.Mutex]::new($true, $Name, [ref]$created, $security) }
+        $status = 'Squatting'
+    }
 }
 Set-Content -LiteralPath $ReadyFile -Value $status
 $deadline = (Get-Date).AddSeconds(60)
@@ -871,6 +887,16 @@ if ($Mode -eq 'Hold') { Exit-MaintenanceLock -Lock $lock }
         $lock.Status | Should -Be 'Untrusted'
         $lock.Owner | Should -Not -BeNullOrEmpty
         $lock.Message | Should -Match 'untrusted account'
+    }
+
+    It 'treats a held lock that hides its owner as untrusted' {
+        $holder = Open-LockHolder -Name $lockName -Mode SquatHidden
+        $holder.Status | Should -Be 'Squatting'
+
+        $lock = Enter-MaintenanceLock -Name $lockName
+
+        $lock.Status | Should -Be 'Untrusted'
+        $lock.Message | Should -Match 'hides its owner'
     }
 
     It 'honours a held lock created by a trusted account' {

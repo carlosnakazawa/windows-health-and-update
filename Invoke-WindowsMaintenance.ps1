@@ -1375,9 +1375,9 @@ function ConvertTo-StepNameList {
 
 function Get-MutexOwnerSid {
     <#
-        Owner SID of a mutex, or $null when it cannot be read. Windows PowerShell 5.1
-        exposes Mutex.GetAccessControl(); PowerShell 7 (.NET) has it as an extension
-        method in System.Threading.AccessControl.
+        Owner SID of a mutex. Windows PowerShell 5.1 exposes Mutex.GetAccessControl();
+        PowerShell 7 (.NET) has it as an extension method in System.Threading.AccessControl.
+        Throws when the owner cannot be read; the caller decides what that means.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -1386,15 +1386,10 @@ function Get-MutexOwnerSid {
         [System.Threading.Mutex] $Mutex
     )
 
-    try {
-        $extensions = 'System.Threading.ThreadingAclExtensions' -as [type]
-        if ($extensions) { $acl = $extensions::GetAccessControl($Mutex) }
-        else { $acl = $Mutex.GetAccessControl() }
-        return $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-    }
-    catch {
-        return $null
-    }
+    $extensions = 'System.Threading.ThreadingAclExtensions' -as [type]
+    if ($extensions) { $acl = $extensions::GetAccessControl($Mutex) }
+    else { $acl = $Mutex.GetAccessControl() }
+    $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
 }
 
 function Enter-MaintenanceLock {
@@ -1410,8 +1405,9 @@ function Enter-MaintenanceLock {
         user could create the mutex first and hold it to block maintenance forever. An
         existing mutex is therefore honoured only when its owner is in -TrustedSid
         (Administrators, SYSTEM and the account running this script). Otherwise the run
-        continues without the lock and says why ("Untrusted"). If the owner cannot be read,
-        the lock is honoured.
+        continues without the lock and says why ("Untrusted"). A lock that denies reading
+        its owner is untrusted too; if the owner cannot be read only because the ACL types
+        are unavailable, the lock is honoured.
 
         Returns Status = Acquired, Busy or Untrusted, Abandoned and the mutex to release
         with Exit-MaintenanceLock.
@@ -1473,7 +1469,26 @@ function Enter-MaintenanceLock {
 
     $owner = $null
     if (-not $createdNew) {
-        $owner = Get-MutexOwnerSid -Mutex $mutex
+        try {
+            $owner = Get-MutexOwnerSid -Mutex $mutex
+        }
+        catch {
+            # .NET can open a mutex with reduced rights, so a squatter can allow SYNCHRONIZE
+            # while denying READ_CONTROL to hide its owner. Every lock this script creates
+            # lets trusted accounts read it, so "access denied" here means untrusted.
+            if ((Get-ExceptionHResult -Exception $_.Exception) -eq -2147024891) {
+                $mutex.Dispose()
+                return [pscustomobject]@{
+                    Status    = 'Untrusted'
+                    Abandoned = $false
+                    Owner     = $null
+                    Mutex     = $null
+                    Message   = "The lock '$Name' hides its owner from this account, so it was not created by this script. Continuing without the single-instance lock."
+                }
+            }
+            # Owner unreadable for another reason (ACL types unavailable): honour the lock.
+            $owner = $null
+        }
         if ($owner -and $owner -notin $trusted) {
             $mutex.Dispose()
             return [pscustomobject]@{
@@ -1640,7 +1655,6 @@ if ($WhatIfPreference) {
     Exit-MaintenanceLock -Lock $lock
 }
 
-$null = New-Item -Path $LogDirectory -ItemType Directory -Force -WhatIf:$false -Confirm:$false
 $startedAt = Get-Date
 $timestamp = $startedAt.ToString('yyyyMMdd_HHmmss')
 $transcriptPath = Join-Path -Path $LogDirectory -ChildPath "maintenance_$timestamp.log"
@@ -1650,7 +1664,11 @@ $rebootReasons = New-Object -TypeName System.Collections.Generic.List[string]
 $transcriptStarted = $false
 $exitCode = 0
 
+# Everything after the lock is acquired runs inside try/finally, so the lock is always
+# released (an unreleased mutex shows up as an interrupted run to the next caller).
 try {
+    $null = New-Item -Path $LogDirectory -ItemType Directory -Force -WhatIf:$false -Confirm:$false
+
     try {
         $null = Start-Transcript -Path $transcriptPath -WhatIf:$false -Confirm:$false
         $transcriptStarted = $true
